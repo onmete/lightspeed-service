@@ -12,6 +12,7 @@ from ols import config, constants, version
 from ols.app import metrics, routers
 from ols.customize import metadata
 from ols.src.config_status import extract_config_status, store_config_status
+from ols.src.mcp.tool_registry import discover_tool_ui_metadata
 
 app = FastAPI(
     title=f"Swagger {metadata.SERVICE_NAME} service - OpenAPI",
@@ -189,6 +190,18 @@ async def log_requests_responses(
 
 
 routers.include_routers(app)
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    """Initialize application on startup."""
+    logger.info("Discovering MCP tool UI metadata...")
+    try:
+        await discover_tool_ui_metadata()
+        logger.info("MCP tool UI metadata discovery completed")
+    except Exception as e:
+        logger.warning("Failed to discover MCP tool UI metadata: %s", e)
+
 
 app_routes_paths = [
     route.path
