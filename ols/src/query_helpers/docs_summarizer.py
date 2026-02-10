@@ -84,6 +84,20 @@ def run_async_safely(coro: Callable) -> Any:
         raise
 
 
+def _fix_tool_schema(tool: Any) -> Any:
+    """Ensure a LangChain tool's input schema includes 'properties'.
+
+    Some MCP servers define tools with ``{"type": "object"}`` but omit
+    ``properties``.  OpenAI (and other LLM providers) reject such schemas
+    with ``object schema missing properties``.  This helper patches the
+    schema dict so it always contains ``"properties": {}``.
+    """
+    schema = getattr(tool, "args_schema", None)
+    if isinstance(schema, dict) and "properties" not in schema:
+        schema["properties"] = {}
+    return tool
+
+
 async def gather_mcp_tools(mcp_servers: dict[str, Any]) -> list:
     """Gather tools from multiple MCP servers with failure isolation.
 
@@ -102,7 +116,7 @@ async def gather_mcp_tools(mcp_servers: dict[str, Any]) -> list:
     for server_name in mcp_servers:
         try:
             server_tools = await mcp_client.get_tools(server_name=server_name)
-            all_tools.extend(server_tools)
+            all_tools.extend(_fix_tool_schema(t) for t in server_tools)
             logger.info(
                 "Loaded %d tools from MCP server '%s'",
                 len(server_tools),
@@ -413,9 +427,21 @@ class DocsSummarizer(QueryHelper):
 
             # Account for tool definitions tokens (schemas sent to LLM)
             if all_mcp_tools:
+
+                def _safe_tool_args(tool: Any) -> dict:
+                    """Get tool args safely; some tools lack 'properties' in their schema."""
+                    try:
+                        return tool.args
+                    except KeyError:
+                        return {}
+
                 tool_definitions_text = json.dumps(
                     [
-                        {"name": t.name, "description": t.description, "schema": t.args}
+                        {
+                            "name": t.name,
+                            "description": t.description,
+                            "schema": _safe_tool_args(t),
+                        }
                         for t in all_mcp_tools
                     ]
                 )
