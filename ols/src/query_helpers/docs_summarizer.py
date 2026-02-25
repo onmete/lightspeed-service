@@ -18,7 +18,11 @@ from ols.app.metrics.token_counter import GenericTokenCounter
 from ols.app.models.models import RagChunk, StreamedChunk, SummarizerResponse
 from ols.constants import MAX_ITERATIONS, GenericLLMParameters
 from ols.customize import reranker
-from ols.src.mcp.tool_registry import get_tool_ui_metadata, is_model_visible
+from ols.src.mcp.tool_registry import (
+    get_ui_resource_uri,
+    get_tool_metadata,
+    is_model_visible,
+)
 from ols.src.prompts.prompt_generator import GeneratePrompt
 from ols.src.query_helpers.query_helper import QueryHelper
 from ols.src.tools.tools import execute_tool_calls
@@ -294,7 +298,9 @@ class DocsSummarizer(QueryHelper):
             # Filter out app-only tools (visibility: ["app"]) before LLM binding
             app_only = [t.name for t in all_mcp_tools if not is_model_visible(t.name)]
             if app_only:
-                logger.info("Excluding %d app-only tools from LLM: %s", len(app_only), app_only)
+                logger.info(
+                    "Excluding %d app-only tools from LLM: %s", len(app_only), app_only
+                )
                 all_mcp_tools = [t for t in all_mcp_tools if is_model_visible(t.name)]
 
             # Track cumulative token usage for tool outputs
@@ -448,8 +454,13 @@ class DocsSummarizer(QueryHelper):
                         tool_name = tool_id_to_name.get(
                             tool_call_message.tool_call_id, "unknown"
                         )
-                        ui_metadata = get_tool_ui_metadata(tool_name)
-                        if ui_metadata and ui_metadata.resource_uri:
+                        tool_metadata = get_tool_metadata(tool_name)
+                        resource_uri = (
+                            get_ui_resource_uri(tool_metadata)
+                            if tool_metadata
+                            else None
+                        )
+                        if resource_uri:
                             llm_messages.append(
                                 ToolMessage(
                                     content=(
@@ -484,7 +495,7 @@ class DocsSummarizer(QueryHelper):
                         tool_name = tool_id_to_name.get(
                             tool_call_message.tool_call_id, "unknown"
                         )
-                        ui_metadata = get_tool_ui_metadata(tool_name)
+                        tool_metadata = get_tool_metadata(tool_name)
 
                         logger.info(
                             json.dumps(
@@ -494,10 +505,10 @@ class DocsSummarizer(QueryHelper):
                                     "tool_name": tool_name,
                                     "status": tool_call_message.status,
                                     "truncated": was_truncated,
-                                    "has_ui": ui_metadata is not None,
-                                    "output_snippet": str(
-                                        tool_call_message.content
-                                    )[:1000],
+                                    "has_metadata": tool_metadata is not None,
+                                    "output_snippet": str(tool_call_message.content)[
+                                        :1000
+                                    ],
                                 },
                                 ensure_ascii=False,
                                 indent=2,
@@ -514,11 +525,16 @@ class DocsSummarizer(QueryHelper):
                             "round": i,
                         }
 
-                        if ui_metadata and ui_metadata.resource_uri:
-                            tool_result_data["ui_resource_uri"] = (
-                                ui_metadata.resource_uri
-                            )
-                            tool_result_data["server_name"] = ui_metadata.server_name
+                        if tool_metadata:
+                            resource_uri = get_ui_resource_uri(tool_metadata)
+
+                            # TODO: given we pass meta, we might no need explicit keys
+                            # for these
+                            if resource_uri:
+                                tool_result_data["ui_resource_uri"] = resource_uri
+                            tool_result_data["server_name"] = tool_metadata.server_name
+                            if tool_metadata.meta:
+                                tool_result_data["meta"] = tool_metadata.meta
 
                         # Forward structured_content from tool result if available
                         structured = tool_call_message.additional_kwargs.get(

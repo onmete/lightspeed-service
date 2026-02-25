@@ -805,7 +805,7 @@ async def test_tool_result_includes_ui_metadata():
         return MockSessionContextManager()
 
     # Create isolated registry dictionaries for this test
-    test_tool_ui_registry: dict = {}
+    test_tool_meta_registry: dict = {}
     test_resource_uri_to_config_name: dict = {}
 
     with (
@@ -827,7 +827,7 @@ async def test_tool_result_includes_ui_metadata():
         ),
         patch("ols.src.mcp.tool_registry.config") as mock_config,
         # Isolate registry state using test-local dictionaries
-        patch("ols.src.mcp.tool_registry._tool_ui_registry", test_tool_ui_registry),
+        patch("ols.src.mcp.tool_registry._tool_meta_registry", test_tool_meta_registry),
         patch(
             "ols.src.mcp.tool_registry._resource_uri_to_config_name",
             test_resource_uri_to_config_name,
@@ -880,3 +880,6 @@ async def test_tool_result_includes_ui_metadata():
         assert tool_result["ui_resource_uri"] == "ui://test_server/namespaces"
         assert "server_name" in tool_result
         assert tool_result["server_name"] == "test_server"
+        assert "meta" in tool_result
+        assert tool_result["meta"]["ui"]["resourceUri"] == "ui://test_server/namespaces"
+        assert tool_result["meta"]["ui"]["visibility"] == ["model", "app"]
