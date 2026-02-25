@@ -735,3 +735,148 @@ def test_resolve_server_headers_no_placeholders():
 
     assert headers is not None
     assert headers == {"Authorization": "Bearer static-token"}
+
+
+@pytest.mark.asyncio
+async def test_tool_result_includes_ui_metadata():
+    """Test that tool results include UI metadata (resource_uri, server_name) when available.
+
+    This test uses the real tool_registry code to discover and store tool metadata,
+    mocking only at the MCP protocol level (session.list_tools) to avoid network calls.
+    This ensures the full metadata discovery and retrieval flow is exercised.
+    """
+    from types import SimpleNamespace
+
+    from ols.src.mcp.tool_registry import discover_tool_ui_metadata
+
+    question = "How many namespaces are there in my cluster?"
+
+    mcp_servers_config = {
+        "test_server": {
+            "transport": "streamable_http",
+            "url": "http://test-server:8080/mcp",
+        },
+    }
+
+    # Create a mock tool with UI metadata
+    mock_tool_with_meta = SimpleNamespace(
+        name="get_namespaces_mock",
+        description="Fetch the list of all namespaces in the cluster.",
+        meta={
+            "ui": {
+                "resourceUri": "ui://test_server/namespaces",
+                "visibility": ["model", "app"],
+            }
+        },
+    )
+
+    # Create mock tools result
+    mock_tools_result = SimpleNamespace(tools=[mock_tool_with_meta])
+
+    # Mock the MCP session to return our tools with metadata
+    mock_session = AsyncMock()
+    mock_session.initialize = AsyncMock()
+    mock_session.list_tools = AsyncMock(return_value=mock_tools_result)
+
+    def mock_streamablehttp_client(*args, **kwargs):
+        """Mock streamablehttp_client context manager."""
+        read_stream = AsyncMock()
+        write_stream = AsyncMock()
+
+        class MockContextManager:
+            async def __aenter__(self):
+                return (read_stream, write_stream, None)
+
+            async def __aexit__(self, *args):
+                pass
+
+        return MockContextManager()
+
+    def mock_client_session(*args, **kwargs):
+        """Mock ClientSession context manager."""
+
+        class MockSessionContextManager:
+            async def __aenter__(self):
+                return mock_session
+
+            async def __aexit__(self, *args):
+                pass
+
+        return MockSessionContextManager()
+
+    # Create isolated registry dictionaries for this test
+    test_tool_ui_registry: dict = {}
+    test_resource_uri_to_config_name: dict = {}
+
+    with (
+        patch("ols.src.query_helpers.docs_summarizer.MAX_ITERATIONS", 2),
+        patch("ols.utils.mcp_utils.MultiServerMCPClient") as mock_mcp_client_cls,
+        patch(
+            "ols.src.query_helpers.docs_summarizer.DocsSummarizer._invoke_llm"
+        ) as mock_invoke,
+        patch(
+            "ols.src.query_helpers.docs_summarizer.build_mcp_config",
+            return_value=mcp_servers_config,
+        ),
+        patch(
+            "ols.src.mcp.tool_registry.streamablehttp_client",
+            side_effect=mock_streamablehttp_client,
+        ),
+        patch(
+            "ols.src.mcp.tool_registry.ClientSession", side_effect=mock_client_session
+        ),
+        patch("ols.src.mcp.tool_registry.config") as mock_config,
+        # Isolate registry state using test-local dictionaries
+        patch("ols.src.mcp.tool_registry._tool_ui_registry", test_tool_ui_registry),
+        patch(
+            "ols.src.mcp.tool_registry._resource_uri_to_config_name",
+            test_resource_uri_to_config_name,
+        ),
+    ):
+        # Setup mock MCP server config for discovery
+        from ols.app.models.config import MCPServerConfig, MCPServers
+
+        mock_server = MCPServerConfig(
+            name="test_server", url="http://test-server:8080/mcp"
+        )
+        mock_server._resolved_headers = {}
+        mock_config.mcp_servers = MCPServers(servers=[mock_server])
+
+        # Run discovery to populate the registry
+        await discover_tool_ui_metadata()
+
+        # Mock LLM to make a tool call then finish
+        mock_invoke.side_effect = lambda *args, **kwargs: async_mock_invoke(
+            [
+                AIMessageChunk(
+                    content="",
+                    response_metadata={"finish_reason": "tool_calls"},
+                    tool_calls=[
+                        {"name": "get_namespaces_mock", "args": {}, "id": "call_id1"},
+                    ],
+                )
+            ]
+        )
+
+        mock_mcp_client_instance = AsyncMock()
+        mock_mcp_client_instance.get_tools.return_value = mock_tools_map
+        mock_mcp_client_cls.return_value = mock_mcp_client_instance
+
+        summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+        summarizer.model_config.parameters.max_tokens_for_tools = 0
+
+        # Collect tool results from the stream
+        tool_results = []
+        async for chunk in summarizer.generate_response(question):
+            if chunk.type == "tool_result":
+                tool_results.append(chunk.data)
+            elif chunk.type == "end":
+                break
+
+        # Verify UI metadata is included in tool result
+        assert len(tool_results) > 0
+        tool_result = tool_results[0]
+        assert "ui_resource_uri" in tool_result
+        assert tool_result["ui_resource_uri"] == "ui://test_server/namespaces"
+        assert "server_name" in tool_result
+        assert tool_result["server_name"] == "test_server"
