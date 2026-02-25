@@ -1,8 +1,8 @@
-"""MCP tool metadata registry for tracking UI-enabled tools."""
+"""MCP tool metadata registry for tracking tools with metadata."""
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
@@ -13,33 +13,67 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class ToolUIMetadata:
-    """Metadata for a tool's UI capabilities.
+class ToolMetadata:
+    """Metadata for a tool from MCP server.
 
-    Tools may have a resource_uri (for rendering UI), visibility constraints,
-    or both. A tool with visibility=["app"] and no resource_uri is an app-only
-    tool that the iframe calls directly but that has no standalone UI resource.
+    Stores the server name and the full metadata dictionary from the tool definition.
+    Use helper functions to extract specific metadata like UI resource URIs or visibility.
     """
 
     server_name: str
-    resource_uri: Optional[str] = None
-    visibility: Optional[list[str]] = None
+    meta: Optional[dict[str, Any]] = None
 
 
-_tool_ui_registry: dict[str, ToolUIMetadata] = {}
+_tool_meta_registry: dict[str, ToolMetadata] = {}
 _resource_uri_to_config_name: dict[str, str] = {}
 
 
-def get_tool_ui_metadata(tool_name: str) -> Optional[ToolUIMetadata]:
-    """Get UI metadata for a tool if it has MCP App support.
+def get_tool_metadata(tool_name: str) -> Optional[ToolMetadata]:
+    """Get metadata for a tool.
 
     Args:
         tool_name: The name of the tool.
 
     Returns:
-        ToolUIMetadata if the tool has UI support, None otherwise.
+        ToolMetadata if the tool has metadata, None otherwise.
     """
-    return _tool_ui_registry.get(tool_name)
+    return _tool_meta_registry.get(tool_name)
+
+
+def get_ui_resource_uri(metadata: ToolMetadata) -> Optional[str]:
+    """Extract the resource URI from tool metadata.
+
+    Args:
+        metadata: The tool metadata.
+
+    Returns:
+        The resource URI if present, None otherwise.
+    """
+    if not metadata.meta:
+        return None
+
+    # Check both formats: _meta.ui.resourceUri and _meta["ui/resourceUri"]
+    ui_meta = metadata.meta.get("ui", {}) if isinstance(metadata.meta, dict) else {}
+    resource_uri = ui_meta.get("resourceUri") if isinstance(ui_meta, dict) else None
+    if not resource_uri and isinstance(metadata.meta, dict):
+        resource_uri = metadata.meta.get("ui/resourceUri")
+    return resource_uri
+
+
+def get_visibility(metadata: ToolMetadata) -> Optional[list[str]]:
+    """Extract the visibility list from tool metadata.
+
+    Args:
+        metadata: The tool metadata.
+
+    Returns:
+        The visibility list if present, None otherwise.
+    """
+    if not metadata.meta:
+        return None
+
+    ui_meta = metadata.meta.get("ui", {}) if isinstance(metadata.meta, dict) else {}
+    return ui_meta.get("visibility") if isinstance(ui_meta, dict) else None
 
 
 def is_model_visible(tool_name: str) -> bool:
@@ -55,10 +89,13 @@ def is_model_visible(tool_name: str) -> bool:
     Returns:
         True if the tool should be included in LLM tool binding.
     """
-    ui_meta = _tool_ui_registry.get(tool_name)
-    if not ui_meta or not ui_meta.visibility:
+    metadata = get_tool_metadata(tool_name)
+    if not metadata:
         return True
-    return "model" in ui_meta.visibility
+    visibility = get_visibility(metadata)
+    if not visibility:
+        return True
+    return "model" in visibility
 
 
 def get_config_name_for_resource_uri(resource_uri: str) -> Optional[str]:
@@ -76,40 +113,55 @@ def get_config_name_for_resource_uri(resource_uri: str) -> Optional[str]:
     return _resource_uri_to_config_name.get(resource_uri)
 
 
-def register_tool_ui(
+def register_tool_metadata(
     tool_name: str,
     server_name: str,
-    resource_uri: Optional[str] = None,
-    visibility: Optional[list[str]] = None,
+    meta: Optional[dict[str, Any]] = None,
 ) -> None:
-    """Register a tool's UI metadata.
+    """Register a tool's metadata.
 
     Args:
         tool_name: The name of the tool.
         server_name: The MCP server name.
-        resource_uri: The UI resource URI (None for visibility-only tools).
-        visibility: Tool visibility scope (e.g. ["model"], ["app"], ["model", "app"]).
+        meta: The full metadata dictionary from the tool definition.
     """
-    _tool_ui_registry[tool_name] = ToolUIMetadata(
-        server_name=server_name,
-        resource_uri=resource_uri,
-        visibility=visibility,
-    )
     logger.info(
-        "Registered UI for tool '%s' from server '%s' (visibility=%s)",
+        "Registered metadata for tool '%s' from server '%s'",
         tool_name,
         server_name,
-        visibility,
     )
+    metadata = ToolMetadata(server_name=server_name, meta=meta)
+    _tool_meta_registry[tool_name] = metadata
+
+    resource_uri = get_ui_resource_uri(metadata)
+
+    # Register resource URI mapping if present
+    if resource_uri and resource_uri.startswith("ui://"):
+        existing = _resource_uri_to_config_name.get(resource_uri)
+        if existing and existing != server_name:
+            logger.error(
+                "Resource URI '%s' already mapped to server '%s', "
+                "overwriting with '%s' - one server's UI resources "
+                "will be unreachable",
+                resource_uri,
+                existing,
+                server_name,
+            )
+        _resource_uri_to_config_name[resource_uri] = server_name
+        logger.info(
+            "Mapped resource URI '%s' to config server '%s'",
+            resource_uri,
+            server_name,
+        )
 
 
-async def discover_tool_ui_metadata() -> None:
-    """Discover and register UI metadata for all configured MCP servers.
+async def discover_tool_metadata() -> None:
+    """Discover and register metadata for all configured MCP servers.
 
-    This queries each MCP server for its tools and checks for _meta.ui metadata.
+    This queries each MCP server for its tools and checks for metadata.
     """
     if not config.mcp_servers or not config.mcp_servers.servers:
-        logger.debug("No MCP servers configured, skipping UI metadata discovery")
+        logger.debug("No MCP servers configured, skipping metadata discovery")
         return
 
     for server in config.mcp_servers.servers:
@@ -117,10 +169,16 @@ async def discover_tool_ui_metadata() -> None:
             await _discover_server_tools(server.name, server.url, server.headers)
         except Exception as e:
             logger.warning(
-                "Failed to discover UI metadata from MCP server '%s': %s",
+                "Failed to discover metadata from MCP server '%s': %s",
                 server.name,
                 e,
             )
+
+
+# Backward compatibility alias
+async def discover_tool_ui_metadata() -> None:
+    """Discover and register metadata for all configured MCP servers (backward compatibility)."""
+    await discover_tool_metadata()
 
 
 async def _discover_server_tools(
@@ -128,7 +186,7 @@ async def _discover_server_tools(
     server_url: str,
     headers: Optional[dict[str, str]] = None,
 ) -> None:
-    """Discover tools with UI metadata from a single MCP server.
+    """Discover tools with metadata from a single MCP server.
 
     Args:
         server_name: The name of the MCP server.
@@ -136,7 +194,7 @@ async def _discover_server_tools(
         headers: Optional authentication headers.
     """
     logger.debug(
-        "Discovering UI metadata from MCP server '%s' at %s", server_name, server_url
+        "Discovering metadata from MCP server '%s' at %s", server_name, server_url
     )
 
     resolved_headers = {}
@@ -168,48 +226,16 @@ async def _discover_server_tools(
                     # MCP SDK uses 'meta' as Python attr (aliased from '_meta' in JSON)
                     meta = getattr(tool, "meta", None) or {}
 
-                    # Check both formats: _meta.ui.resourceUri and _meta["ui/resourceUri"]
-                    ui_meta = meta.get("ui", {}) if isinstance(meta, dict) else {}
-                    resource_uri = ui_meta.get("resourceUri")
-                    if not resource_uri and isinstance(meta, dict):
-                        resource_uri = meta.get("ui/resourceUri")
-
-                    visibility = ui_meta.get("visibility") if isinstance(ui_meta, dict) else None
-
-                    has_ui_metadata = resource_uri or visibility
-
-                    if has_ui_metadata:
-                        register_tool_ui(
-                            tool.name, server_name, resource_uri, visibility=visibility,
-                        )
-
-                        if resource_uri and resource_uri.startswith("ui://"):
-                            existing = _resource_uri_to_config_name.get(resource_uri)
-                            if existing and existing != server_name:
-                                logger.error(
-                                    "Resource URI '%s' already mapped to server '%s', "
-                                    "overwriting with '%s' - one server's UI resources "
-                                    "will be unreachable",
-                                    resource_uri,
-                                    existing,
-                                    server_name,
-                                )
-                            _resource_uri_to_config_name[resource_uri] = server_name
-                            logger.info(
-                                "Mapped resource URI '%s' to config server '%s'",
-                                resource_uri,
-                                server_name,
-                            )
-
-                        logger.debug(
-                            "Found UI metadata for tool '%s' (resource=%s, visibility=%s)",
+                    # Register all tools with metadata if they have any
+                    if meta and isinstance(meta, dict):
+                        register_tool_metadata(
                             tool.name,
-                            resource_uri,
-                            visibility,
+                            server_name,
+                            meta=meta,
                         )
                     else:
                         logger.debug(
-                            "Tool '%s' has no UI metadata (meta=%s)",
+                            "Tool '%s' has no metadata (meta=%s)",
                             tool.name,
                             meta,
                         )

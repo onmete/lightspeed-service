@@ -76,6 +76,12 @@ make test              # All tests
 make coverage-report   # Generate HTML coverage report
 ```
 
+To run indivudual unit tests during development, you can use pytest with:
+
+```bash
+pdm run pytest
+```
+
 ## Configuration Patterns
 
 ### Config Structure
