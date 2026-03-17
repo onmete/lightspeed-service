@@ -591,6 +591,86 @@ def test_tool_token_tracking(caplog):
         )
 
 
+def test_tool_output_token_tracking_uses_buffer_weight(caplog):
+    """Test that tool output tokens are counted with TOKEN_BUFFER_WEIGHT like other budget items.
+
+    Before this fix, raw len(tokens) was used for tool outputs while tool definitions
+    and AIMessage tokens used _get_token_count() (which applies a 1.1x buffer).
+    This test asserts _get_token_count() is called for tool output tokens by spying on
+    it: with one tool call in one round it must be called at least 3 times
+    (tool definitions, AIMessage, tool output).
+    """
+    mcp_servers_config = {
+        "test_server": {
+            "transport": "streamable_http",
+            "url": "http://test-server:8080/mcp",
+        },
+    }
+
+    original_get_token_count = TokenHandler._get_token_count
+    call_count = 0
+
+    def counting_get_token_count(tokens: list) -> int:
+        nonlocal call_count
+        call_count += 1
+        return original_get_token_count(tokens)
+
+    with (
+        patch(
+            "ols.src.query_helpers.docs_summarizer.DocsSummarizer._get_max_iterations",
+            return_value=2,
+        ),
+        patch("ols.utils.mcp_utils.MultiServerMCPClient") as mock_mcp_client_cls,
+        patch(
+            "ols.src.query_helpers.docs_summarizer.DocsSummarizer._invoke_llm"
+        ) as mock_invoke,
+        patch("ols.utils.mcp_utils.config") as mock_config,
+        patch.object(
+            TokenHandler, "_get_token_count", staticmethod(counting_get_token_count)
+        ),
+    ):
+        mock_config.tools_rag = None
+        mock_config.mcp_servers.servers = [MagicMock()]
+
+        with patch(
+            "ols.utils.mcp_utils._gather_and_populate_tools",
+            new=AsyncMock(return_value=(mcp_servers_config, mock_tools_map)),
+        ):
+            mock_invoke.side_effect = lambda *args, **kwargs: async_mock_invoke(
+                [
+                    AIMessageChunk(
+                        content="",
+                        response_metadata={"finish_reason": "tool_calls"},
+                        tool_calls=[
+                            {
+                                "name": "get_namespaces_mock",
+                                "args": {},
+                                "id": "call_id1",
+                            },
+                        ],
+                    )
+                ]
+            )
+
+        mock_mcp_client_instance = AsyncMock()
+        mock_mcp_client_instance.get_tools.return_value = mock_tools_map
+        mock_mcp_client_cls.return_value = mock_mcp_client_instance
+
+        summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+        summarizer.model_config.parameters.max_tokens_for_tools = 50000
+        summarizer.model_config.parameters.max_tokens_per_tool_output = 8000
+        summarizer.create_response("How many namespaces?")
+
+    # _get_token_count must be called for:
+    #   1. tool definitions (once at the start of the loop)
+    #   2. AIMessage with tool_calls
+    #   3. tool output (the change introduced by this fix)
+    assert call_count >= 3, (
+        f"Expected _get_token_count to be called at least 3 times "
+        f"(definitions + AIMessage + tool output), got {call_count}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_gather_mcp_tools_failure_isolation(caplog):
     """Test gather_mcp_tools isolates failures from individual MCP servers.

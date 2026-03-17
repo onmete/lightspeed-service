@@ -571,12 +571,15 @@ class DocsSummarizer(QueryHelper):
                     )
                     messages.extend(tool_calls_messages)
 
-                    # Track tokens used by tool outputs
+                    # Track tokens used by tool outputs (buffered, consistent with
+                    # how tool definitions and AIMessage tokens are counted).
                     for tool_call_message in tool_calls_messages:
                         content_tokens = token_handler.text_to_tokens(
                             str(tool_call_message.content)
                         )
-                        tool_tokens_used += len(content_tokens)
+                        tool_tokens_used += TokenHandler._get_token_count(
+                            content_tokens
+                        )
 
                     for result_chunk in _build_tool_result_chunks(
                         tool_calls, tool_calls_messages, all_mcp_tools, i
