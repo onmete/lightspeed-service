@@ -4,10 +4,14 @@ from math import ceil
 from unittest import TestCase, mock
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from ols.constants import TOKEN_BUFFER_WEIGHT
-from ols.utils.token_handler import PromptTooLongError, TokenHandler
+from ols.utils.token_handler import (
+    ContextWindowBudget,
+    PromptTooLongError,
+    TokenHandler,
+)
 from tests.mock_classes.mock_retrieved_node import MockRetrievedNode
 
 
@@ -324,3 +328,125 @@ class TestTokenHandler(TestCase):
                 max_tokens_for_response,
                 max_tokens_for_tools,
             )
+
+    def test_count_message_tokens_human_message(self):
+        """Test count_message_tokens for HumanMessage matches old serialization."""
+        msg = HumanMessage("first message from human")
+        old_count = TokenHandler._get_token_count(
+            self._token_handler_obj.text_to_tokens(f"{msg.type}: {msg.content}")
+        )
+        new_count = self._token_handler_obj.count_message_tokens(msg)
+        assert new_count == old_count
+
+    def test_count_message_tokens_ai_message_no_tools(self):
+        """Test count_message_tokens for plain AIMessage matches old serialization."""
+        msg = AIMessage("first answer from AI")
+        old_count = TokenHandler._get_token_count(
+            self._token_handler_obj.text_to_tokens(f"{msg.type}: {msg.content}")
+        )
+        new_count = self._token_handler_obj.count_message_tokens(msg)
+        assert new_count == old_count
+
+    def test_count_message_tokens_ai_message_with_tool_calls(self):
+        """Test count_message_tokens counts tool_calls data for AIMessage."""
+        msg_plain = AIMessage("thinking")
+        msg_with_tools = AIMessage(
+            content="thinking",
+            tool_calls=[{"name": "get_pods", "args": {"ns": "default"}, "id": "c1"}],
+        )
+        plain_count = self._token_handler_obj.count_message_tokens(msg_plain)
+        tools_count = self._token_handler_obj.count_message_tokens(msg_with_tools)
+        assert tools_count > plain_count
+
+    def test_count_message_tokens_tool_message(self):
+        """Test count_message_tokens includes tool_call_id for ToolMessage."""
+        msg_no_id = HumanMessage("tool result data")
+        msg_tool = ToolMessage(content="tool result data", tool_call_id="call_abc123")
+        no_id_count = self._token_handler_obj.count_message_tokens(msg_no_id)
+        tool_count = self._token_handler_obj.count_message_tokens(msg_tool)
+        assert tool_count > no_id_count
+
+    def test_count_message_tokens_list_content(self):
+        """Test count_message_tokens handles list content (content blocks)."""
+        msg = AIMessage(
+            content=[{"type": "text", "text": "hello"}, {"type": "reasoning"}]
+        )
+        count = self._token_handler_obj.count_message_tokens(msg)
+        assert count > 0
+
+
+class TestContextWindowBudget(TestCase):
+    """Test cases for ContextWindowBudget."""
+
+    def test_initial_augmentation_available(self):
+        """Test augmentation_available reflects reserves."""
+        budget = ContextWindowBudget(total=1000, response_reserve=200, tool_reserve=100)
+        assert budget.augmentation_available == 700
+
+    def test_consume_prompt_reduces_available(self):
+        """Test consume_prompt reduces augmentation_available."""
+        budget = ContextWindowBudget(total=1000, response_reserve=200)
+        budget.consume_prompt(300)
+        assert budget.augmentation_available == 500
+        assert budget.prompt_tokens == 300
+
+    def test_consume_rag_reduces_available(self):
+        """Test consume_rag reduces augmentation_available."""
+        budget = ContextWindowBudget(total=1000, response_reserve=200)
+        budget.consume_prompt(100)
+        budget.consume_rag(200)
+        assert budget.augmentation_available == 500
+        assert budget.rag_tokens == 200
+
+    def test_consume_history_reduces_available(self):
+        """Test consume_history reduces augmentation_available."""
+        budget = ContextWindowBudget(total=1000, response_reserve=200)
+        budget.consume_prompt(100)
+        budget.consume_rag(100)
+        budget.consume_history(100)
+        assert budget.augmentation_available == 500
+        assert budget.history_tokens == 100
+
+    def test_tool_remaining(self):
+        """Test tool_remaining tracks tool budget consumption."""
+        budget = ContextWindowBudget(total=1000, response_reserve=200, tool_reserve=300)
+        assert budget.tool_remaining == 300
+        budget.consume_tools(100)
+        assert budget.tool_remaining == 200
+        assert budget.tool_tokens == 100
+
+    def test_consume_tools_does_not_affect_augmentation(self):
+        """Test that tool consumption is separate from augmentation budget."""
+        budget = ContextWindowBudget(total=1000, response_reserve=200, tool_reserve=300)
+        budget.consume_prompt(100)
+        available_before = budget.augmentation_available
+        budget.consume_tools(200)
+        assert budget.augmentation_available == available_before
+
+    def test_effective_per_tool_limit(self):
+        """Test effective_per_tool_limit is min of per_tool and remaining."""
+        budget = ContextWindowBudget(total=1000, response_reserve=200, tool_reserve=300)
+        assert budget.effective_per_tool_limit(500) == 300
+        assert budget.effective_per_tool_limit(100) == 100
+        budget.consume_tools(250)
+        assert budget.effective_per_tool_limit(100) == 50
+
+    def test_check_fits_or_raise_passes(self):
+        """Test check_fits_or_raise does not raise when prompt fits."""
+        budget = ContextWindowBudget(total=1000, response_reserve=200)
+        budget.consume_prompt(100)
+        budget.check_fits_or_raise()
+
+    def test_check_fits_or_raise_fails(self):
+        """Test check_fits_or_raise raises PromptTooLongError on overflow."""
+        budget = ContextWindowBudget(total=100, response_reserve=50, tool_reserve=30)
+        budget.consume_prompt(25)
+        with pytest.raises(PromptTooLongError, match="exceeds LLM"):
+            budget.check_fits_or_raise()
+
+    def test_no_tool_reserve_by_default(self):
+        """Test tool_reserve defaults to 0."""
+        budget = ContextWindowBudget(total=1000, response_reserve=200)
+        assert budget.tool_reserve == 0
+        assert budget.tool_remaining == 0
+        assert budget.augmentation_available == 800

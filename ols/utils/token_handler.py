@@ -1,9 +1,11 @@
 """Utility to handle tokens."""
 
+import json
 import logging
+from dataclasses import dataclass, field
 from math import ceil
 
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from llama_index.core.schema import NodeWithScore
 from tiktoken import get_encoding
 
@@ -21,6 +23,71 @@ logger = logging.getLogger(__name__)
 
 class PromptTooLongError(Exception):
     """Prompt is too long."""
+
+
+@dataclass
+class ContextWindowBudget:
+    """Track context window token budget across all consumers.
+
+    A single object that flows through the full request lifecycle,
+    recording how the context window is divided between prompt,
+    RAG, history, response, and tools.
+    """
+
+    total: int
+    response_reserve: int
+    tool_reserve: int = 0
+
+    prompt_tokens: int = field(default=0, init=False)
+    rag_tokens: int = field(default=0, init=False)
+    history_tokens: int = field(default=0, init=False)
+    tool_tokens: int = field(default=0, init=False)
+
+    @property
+    def augmentation_available(self) -> int:
+        """Return tokens available for RAG and history."""
+        return (
+            self.total
+            - self.response_reserve
+            - self.tool_reserve
+            - self.prompt_tokens
+            - self.rag_tokens
+            - self.history_tokens
+        )
+
+    @property
+    def tool_remaining(self) -> int:
+        """Return remaining tool token budget."""
+        return self.tool_reserve - self.tool_tokens
+
+    def consume_prompt(self, tokens: int) -> None:
+        """Record tokens consumed by the prompt skeleton."""
+        self.prompt_tokens += tokens
+
+    def consume_rag(self, tokens: int) -> None:
+        """Record tokens consumed by RAG context."""
+        self.rag_tokens += tokens
+
+    def consume_history(self, tokens: int) -> None:
+        """Record tokens consumed by conversation history."""
+        self.history_tokens += tokens
+
+    def consume_tools(self, tokens: int) -> None:
+        """Record tokens consumed by tool operations."""
+        self.tool_tokens += tokens
+
+    def effective_per_tool_limit(self, max_per_tool: int) -> int:
+        """Compute the effective per-tool output limit from remaining budget."""
+        return min(max_per_tool, self.tool_remaining)
+
+    def check_fits_or_raise(self) -> None:
+        """Raise PromptTooLongError if the prompt exceeds available space."""
+        if self.augmentation_available < 0:
+            limit = self.total - self.response_reserve - self.tool_reserve
+            raise PromptTooLongError(
+                f"Prompt length {self.prompt_tokens} exceeds LLM "
+                f"available context window limit {limit} tokens"
+            )
 
 
 class TokenHandler:
@@ -208,6 +275,34 @@ class TokenHandler:
         )
         return rag_chunks, max_tokens
 
+    def count_message_tokens(self, message: BaseMessage) -> int:
+        """Count tokens for a LangChain message, handling all message types.
+
+        Properly serializes structured message types so that AIMessage
+        with tool_calls and ToolMessage are not undercounted.
+
+        Args:
+            message: Any LangChain message.
+
+        Returns:
+            Buffered token count for the message.
+        """
+        content = message.content
+        if isinstance(content, list):
+            content_text = json.dumps(content)
+        else:
+            content_text = str(content)
+
+        parts = [f"{message.type}: {content_text}"]
+
+        if isinstance(message, AIMessage) and message.tool_calls:
+            parts.append(json.dumps(message.tool_calls))
+
+        if isinstance(message, ToolMessage) and message.tool_call_id:
+            parts.insert(0, f"tool_call_id:{message.tool_call_id} ")
+
+        return TokenHandler._get_token_count(self.text_to_tokens("".join(parts)))
+
     def limit_conversation_history(
         self, history: list[BaseMessage], limit: int = 0
     ) -> tuple[list[BaseMessage], bool]:
@@ -216,9 +311,7 @@ class TokenHandler:
         index = 0
 
         for message in reversed(history):
-            message_length = TokenHandler._get_token_count(
-                self.text_to_tokens(f"{message.type}: {message.content}")
-            )
+            message_length = self.count_message_tokens(message)
             total_length += message_length + 1  # 1 for new-line char
 
             # if total length of already checked messages is higher than limit
