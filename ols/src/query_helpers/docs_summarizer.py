@@ -5,7 +5,6 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Coroutine, Optional, TypeAlias
 
 from langchain_core.globals import set_debug
@@ -24,19 +23,12 @@ from ols.src.prompts.prompt_generator import GeneratePrompt
 from ols.src.query_helpers.query_helper import QueryHelper
 from ols.src.tools.tools import execute_tool_calls
 from ols.utils.mcp_utils import ClientHeaders, build_mcp_config, get_mcp_tools
-from ols.utils.token_handler import TokenHandler
+from ols.utils.token_handler import ContextWindowBudget, TokenHandler
 
 logger = logging.getLogger(__name__)
 
 MIN_TOOL_EXECUTION_TOKENS = 100
 ToolCallDefinition: TypeAlias = tuple[str, dict[str, object], StructuredTool]
-
-
-@dataclass(slots=True)
-class ToolTokenUsage:
-    """Mutable holder for cumulative tool-token usage across helper boundaries."""
-
-    used: int
 
 
 def skip_special_chunk(
@@ -151,6 +143,7 @@ class DocsSummarizer(QueryHelper):
     def _prepare_prompt(
         self,
         query: str,
+        budget: ContextWindowBudget,
         rag_retriever: Optional[BaseRetriever] = None,
         history: Optional[list[BaseMessage]] = None,
     ) -> tuple[ChatPromptTemplate, dict[str, str], list[RagChunk], bool]:
@@ -158,6 +151,7 @@ class DocsSummarizer(QueryHelper):
 
         Args:
             query: The query to be summarized.
+            budget: Context window budget tracking all token consumption.
             rag_retriever: The retriever to get RAG data/context.
             history: The history of the conversation (if available).
 
@@ -165,39 +159,40 @@ class DocsSummarizer(QueryHelper):
             A tuple containing the final prompt, input values, RAG chunks,
             and a flag for truncated history.
         """
-        # if history is not provided, initialize to empty history
         if history is None:
             history = []
 
         token_handler = TokenHandler()
 
-        # Use sample text for context/history to get complete prompt
-        # instruction. This is used to calculate available tokens.
         temp_prompt, temp_prompt_input = GeneratePrompt(
-            # Sample prompt's context/history must be re-structured for the given model,
-            # to ensure the further right available token calculation.
             query,
             ["sample"],
             [AIMessage("sample")],
             self._system_prompt,
             self._tool_calling_enabled,
         ).generate_prompt(self.model)
-        max_tokens_for_tools = (
-            self.model_config.parameters.max_tokens_for_tools if self.mcp_servers else 0
+
+        skeleton_text = temp_prompt.format(**temp_prompt_input)
+        prompt_tokens = TokenHandler._get_token_count(
+            token_handler.text_to_tokens(skeleton_text)
         )
-        available_tokens = token_handler.calculate_and_check_available_tokens(
-            temp_prompt.format(**temp_prompt_input),
-            self.model_config.context_window_size,
-            self.model_config.parameters.max_tokens_for_response,
-            max_tokens_for_tools,
+        budget.consume_prompt(prompt_tokens)
+        budget.check_fits_or_raise()
+
+        logger.debug(
+            "Budget after prompt: total=%d, response_reserve=%d, tool_reserve=%d, "
+            "prompt=%d, augmentation_available=%d",
+            budget.total,
+            budget.response_reserve,
+            budget.tool_reserve,
+            budget.prompt_tokens,
+            budget.augmentation_available,
         )
 
-        # Retrieve RAG content
         if rag_retriever:
             retrieved_nodes = rag_retriever.retrieve(query)
             logger.info("Retrieved %d documents from indexes", len(retrieved_nodes))
 
-            # Logging top retrieved candidates with scores
             for i, node in enumerate(retrieved_nodes[:5]):
                 logger.info(
                     "Retrieved doc #%d: title='%s', url='%s', index='%s', score=%.4f",
@@ -208,9 +203,11 @@ class DocsSummarizer(QueryHelper):
                     node.get_score(raise_error=False),
                 )
 
-            rag_chunks, available_tokens = token_handler.truncate_rag_context(
-                retrieved_nodes, available_tokens
+            available_for_rag = budget.augmentation_available
+            rag_chunks, leftover = token_handler.truncate_rag_context(
+                retrieved_nodes, available_for_rag
             )
+            budget.consume_rag(available_for_rag - leftover)
         else:
             logger.warning("Proceeding without RAG content. Check start up messages.")
             rag_chunks = []
@@ -218,10 +215,14 @@ class DocsSummarizer(QueryHelper):
         if len(rag_context) == 0:
             logger.debug("Using llm to answer the query without reference content")
 
-        # Truncate history
         history, truncated = token_handler.limit_conversation_history(
-            history or [], available_tokens
+            history or [], budget.augmentation_available
         )
+        if history:
+            history_tokens = sum(
+                token_handler.count_message_tokens(m) + 1 for m in history
+            )
+            budget.consume_history(history_tokens)
 
         final_prompt, llm_input_values = GeneratePrompt(
             query,
@@ -231,14 +232,11 @@ class DocsSummarizer(QueryHelper):
             self._tool_calling_enabled,
         ).generate_prompt(self.model)
 
-        # Tokens-check: We trigger the computation of the token count
-        # without care about the return value. This is to ensure that
-        # the query is within the token limit.
         token_handler.calculate_and_check_available_tokens(
             final_prompt.format(**llm_input_values),
-            self.model_config.context_window_size,
-            self.model_config.parameters.max_tokens_for_response,
-            max_tokens_for_tools,
+            budget.total,
+            budget.response_reserve,
+            budget.tool_reserve,
         )
 
         return final_prompt, llm_input_values, rag_chunks, truncated
@@ -541,7 +539,7 @@ class DocsSummarizer(QueryHelper):
             A tuple of (token_count_for_tool_content, streamed_tool_result_chunk).
         """
         content_tokens = token_handler.text_to_tokens(str(tool_call_message.content))
-        content_token_count = len(content_tokens)
+        content_token_count = TokenHandler._get_token_count(content_tokens)
 
         was_truncated = tool_call_message.additional_kwargs.get("truncated", False)
         base_status = tool_call_message.status
@@ -597,14 +595,10 @@ class DocsSummarizer(QueryHelper):
         duplicate_tool_names: set[str],
         messages: ChatPromptTemplate,
         token_handler: TokenHandler,
-        tool_token_usage: ToolTokenUsage,
-        max_tokens_for_tools: int,
+        budget: ContextWindowBudget,
         max_tokens_per_tool: int,
     ) -> AsyncGenerator[StreamedChunk, None]:
         """Resolve, execute, and stream one round of tool calls."""
-        tool_tokens_used = tool_token_usage.used
-
-        # Finalize streamed chunks into complete tool calls.
         tool_calls = tool_calls_from_tool_calls_chunks(tool_call_chunks)
         tool_call_definitions, skipped_tool_messages = (
             self._resolve_tool_call_definitions(
@@ -617,7 +611,6 @@ class DocsSummarizer(QueryHelper):
             logger.warning(
                 "No executable tools resolved from tool calls in round %s", round_index
             )
-            tool_token_usage.used = tool_tokens_used
             return
 
         # Accumulate the full AI message (reasoning + tool calls) so reasoning
@@ -638,8 +631,6 @@ class DocsSummarizer(QueryHelper):
             )
         messages.append(ai_tool_call_message)
 
-        # Charge token budget for the assistant tool-call message itself, so
-        # subsequent per-tool limits are computed from the remaining budget.
         ai_content_text = (
             json.dumps(ai_tool_call_message.content)
             if isinstance(ai_tool_call_message.content, list)
@@ -648,15 +639,12 @@ class DocsSummarizer(QueryHelper):
         ai_message_tokens = TokenHandler._get_token_count(
             token_handler.text_to_tokens(ai_content_text + json.dumps(tool_calls))
         )
-        tool_tokens_used += ai_message_tokens
+        budget.consume_tools(ai_message_tokens)
 
-        # Build a mapping from tool_call_id -> tool_name for result enrichment.
         tool_id_to_name: dict[str, str] = {
             str(tc.get("id", "")): str(tc.get("name", "unknown")) for tc in tool_calls
         }
 
-        # Log and emit tool-call intents enriched with MCP metadata so the UI
-        # can associate calls with their server and preload resources.
         for tool_call in tool_calls:
             enriched: dict[str, Any] = {**tool_call}
             tool_name = str(tool_call.get("name", "unknown"))
@@ -675,20 +663,15 @@ class DocsSummarizer(QueryHelper):
             )
             yield StreamedChunk(type=ChunkType.TOOL_CALL, data=enriched)
 
-        # Derive per-tool execution cap from remaining global tool budget so we
-        # do not exceed max_tokens_for_tools across this request.
-        remaining_tool_budget = max_tokens_for_tools - tool_tokens_used
-        effective_per_tool_limit = min(max_tokens_per_tool, remaining_tool_budget)
+        effective_per_tool_limit = budget.effective_per_tool_limit(max_tokens_per_tool)
         logger.debug(
             "Tool budget: used=%d, remaining=%d, per_tool_limit=%d",
-            tool_tokens_used,
-            remaining_tool_budget,
+            budget.tool_tokens,
+            budget.tool_remaining,
             effective_per_tool_limit,
         )
 
         tool_calls_messages: list[ToolMessage] = []
-        # Execute resolved tool calls and consume streamed execution events
-        # (approval prompts + final tool results).
         if tool_call_definitions:
             # Enforce strict global tool budget. If model config uses a lower
             # max per-tool cap, lower the minimum accordingly so tools are not
@@ -702,7 +685,7 @@ class DocsSummarizer(QueryHelper):
                     "(remaining=%d, minimum_required=%d)",
                     len(tool_call_definitions),
                     round_index,
-                    remaining_tool_budget,
+                    budget.tool_remaining,
                     minimum_required_tokens,
                 )
                 # Emit synthetic tool results for skipped executions so client/UI
@@ -712,7 +695,7 @@ class DocsSummarizer(QueryHelper):
                         ToolMessage(
                             content=(
                                 f"Tool '{tool.name}' call skipped: remaining tool token budget "
-                                f"({remaining_tool_budget}) is below minimum required "
+                                f"({budget.tool_remaining}) is below minimum required "
                                 f"({minimum_required_tokens}). "
                                 "Do not retry this exact tool call."
                             ),
@@ -731,8 +714,6 @@ class DocsSummarizer(QueryHelper):
                     effective_per_tool_limit,
                 )
 
-        # Merge synthetic skipped outcomes with real execution outcomes and
-        # append all of them to conversation state for the next LLM turn.
         all_tool_messages = skipped_tool_messages + tool_calls_messages
         messages.extend(all_tool_messages)
 
@@ -747,10 +728,8 @@ class DocsSummarizer(QueryHelper):
                     round_index=round_index,
                 )
             )
-            tool_tokens_used += content_token_count
+            budget.consume_tools(content_token_count)
             yield tool_result_chunk
-
-        tool_token_usage.used = tool_tokens_used
 
     async def iterate_with_tools(  # noqa: C901
         self,
@@ -759,6 +738,7 @@ class DocsSummarizer(QueryHelper):
         llm_input_values: dict[str, str],
         token_counter: GenericTokenCounter,
         all_mcp_tools: list[StructuredTool],
+        budget: ContextWindowBudget,
     ) -> AsyncGenerator[StreamedChunk, None]:
         """Iterate through multiple rounds of LLM invocation with tool calling.
 
@@ -768,14 +748,15 @@ class DocsSummarizer(QueryHelper):
             llm_input_values: Input values for the LLM
             token_counter: Counter for tracking token usage
             all_mcp_tools: All resolved MCP tools available for the request.
+            budget: Context window budget for unified token tracking.
 
         Yields:
             StreamedChunk objects representing parts of the response
         """
-        all_tools_dict: dict[str, StructuredTool] = {}
-        duplicate_tool_names: set[str] = set()
         # Build a stable name->tool map once per request and disable ambiguous
         # duplicates so a tool name resolves to at most one executable tool.
+        all_tools_dict: dict[str, StructuredTool] = {}
+        duplicate_tool_names: set[str] = set()
         for tool in all_mcp_tools:
             if tool.name in all_tools_dict:
                 duplicate_tool_names.add(tool.name)
@@ -789,13 +770,9 @@ class DocsSummarizer(QueryHelper):
                 sorted(duplicate_tool_names),
             )
 
-        # Track cumulative token usage for tool outputs
-        tool_tokens_used = 0
-        max_tokens_for_tools = self.model_config.parameters.max_tokens_for_tools
         max_tokens_per_tool = self.model_config.parameters.max_tokens_per_tool_output
         token_handler = TokenHandler()
 
-        # Account for tool definitions tokens (schemas sent to LLM)
         if all_mcp_tools:
             tool_definitions_text = json.dumps(
                 [
@@ -806,17 +783,13 @@ class DocsSummarizer(QueryHelper):
             tool_definitions_tokens = TokenHandler._get_token_count(
                 token_handler.text_to_tokens(tool_definitions_text)
             )
-            tool_tokens_used += tool_definitions_tokens
+            budget.consume_tools(tool_definitions_tokens)
             logger.debug("Tool definitions consume %d tokens", tool_definitions_tokens)
 
-        # Tool calling in a loop
         for i in range(1, max_rounds + 1):
-            # Final round must produce only the assistant answer (no more tool calls),
-            # either because tools are disabled or we reached the max tool-call rounds.
             is_final_round = (not all_mcp_tools) or (i == max_rounds)
             logger.debug("Tool calling round %s (final: %s)", i, is_final_round)
 
-            # Phase 1: collect one LLM round (text chunks + potential tool-call chunks).
             (
                 tool_call_chunks,
                 all_chunks,
@@ -830,22 +803,15 @@ class DocsSummarizer(QueryHelper):
                 token_counter=token_counter,
                 round_index=i,
             )
-            # Emit all text chunks produced during this LLM round.
             for streamed_chunk in round_streamed_chunks:
                 yield streamed_chunk
-            # Stop immediately when helper indicates terminal condition
-            # (final answer reached or timeout fallback emitted).
             if should_stop_iteration:
                 return
 
-            # exit if this was the final round
             if is_final_round:
                 break
 
-            # tool calling part
             if tool_call_chunks:
-                # Phase 2: resolve and execute tool calls for this round.
-                tool_token_usage = ToolTokenUsage(used=tool_tokens_used)
                 # No outer timeout here — each MCP server enforces its own
                 # configured timeout at the transport layer.
                 try:
@@ -857,8 +823,7 @@ class DocsSummarizer(QueryHelper):
                         duplicate_tool_names=duplicate_tool_names,
                         messages=messages,
                         token_handler=token_handler,
-                        tool_token_usage=tool_token_usage,
-                        max_tokens_for_tools=max_tokens_for_tools,
+                        budget=budget,
                         max_tokens_per_tool=max_tokens_per_tool,
                     ):
                         yield streamed_chunk
@@ -871,7 +836,6 @@ class DocsSummarizer(QueryHelper):
                         ),
                     )
                     return
-                tool_tokens_used = tool_token_usage.used
 
     async def generate_response(
         self,
@@ -889,8 +853,17 @@ class DocsSummarizer(QueryHelper):
         Yields:
             StreamedChunk objects representing parts of the response
         """
+        budget = ContextWindowBudget(
+            total=self.model_config.context_window_size,
+            response_reserve=self.model_config.parameters.max_tokens_for_response,
+            tool_reserve=(
+                self.model_config.parameters.max_tokens_for_tools
+                if self.mcp_servers
+                else 0
+            ),
+        )
         final_prompt, llm_input_values, rag_chunks, truncated = self._prepare_prompt(
-            query, rag_retriever, history
+            query, budget, rag_retriever, history
         )
         messages = final_prompt.model_copy()
         all_mcp_tools = await get_mcp_tools(query, self.user_token, self.client_headers)
@@ -905,6 +878,7 @@ class DocsSummarizer(QueryHelper):
                 token_counter=token_counter,
                 llm_input_values=llm_input_values,
                 all_mcp_tools=all_mcp_tools,
+                budget=budget,
             ):
                 yield response
 
