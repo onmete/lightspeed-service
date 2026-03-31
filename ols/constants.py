@@ -5,7 +5,6 @@ import ssl
 from enum import StrEnum
 
 # providers
-PROVIDER_BAM = "bam"
 PROVIDER_OPENAI = "openai"
 PROVIDER_AZURE_OPENAI = "azure_openai"
 PROVIDER_WATSONX = "watsonx"
@@ -14,7 +13,6 @@ PROVIDER_RHELAI_VLLM = "rhelai_vllm"
 PROVIDER_FAKE = "fake_provider"
 SUPPORTED_PROVIDER_TYPES = frozenset(
     {
-        PROVIDER_BAM,
         PROVIDER_OPENAI,
         PROVIDER_AZURE_OPENAI,
         PROVIDER_WATSONX,
@@ -34,6 +32,13 @@ class ModelFamily(StrEnum):
     GRANITE = "granite"
 
 
+class QueryMode(StrEnum):
+    """Query modes that control which system prompt is used."""
+
+    ASK = "ask"
+    TROUBLESHOOTING = "troubleshooting"
+
+
 class GenericLLMParameters:
     """Generic LLM parameters that can be mapped into LLM provider-specific parameters."""
 
@@ -42,10 +47,6 @@ class GenericLLMParameters:
     TOP_K = "top_k"
     TOP_P = "top_p"
     TEMPERATURE = "temperature"
-
-
-# Max Iteration for tool calling
-MAX_ITERATIONS = 5
 
 
 # Token related constants
@@ -62,6 +63,7 @@ DEFAULT_CONTEXT_WINDOW_SIZE = 128000
 # It should be in reasonable proportion to context window limit; otherwise unnecessary
 # truncation will happen. If not set, default value will be used.
 DEFAULT_MAX_TOKENS_FOR_RESPONSE = 4096
+DEFAULT_MAX_ITERATIONS = 5
 
 
 # Tokenizer model to generate tokens (for an approximated token calculation)
@@ -70,11 +72,9 @@ DEFAULT_TOKENIZER_MODEL = "cl100k_base"
 # Example: 1.05 means we increase by 5%.
 TOKEN_BUFFER_WEIGHT = 1.1
 
-# Tool output token limits
-# Maximum tokens for a single tool output before truncation
-DEFAULT_MAX_TOKENS_PER_TOOL_OUTPUT = 8000
-# Total tokens reserved for all tool outputs (only used when MCP servers configured)
-DEFAULT_MAX_TOKENS_FOR_TOOLS = 32000
+# Fraction of context window reserved for tool outputs (only when MCP servers configured).
+# Computed as int(context_window_size * ratio) at startup.
+DEFAULT_TOOL_BUDGET_RATIO = 0.25
 
 
 # RAG related constants
@@ -185,8 +185,18 @@ CERTIFICATE_STORAGE_FILENAME = "ols.pem"
 # Default SSL version used by FastAPI REST API
 DEFAULT_SSL_VERSION = ssl.PROTOCOL_TLS_SERVER
 
-# Default SSL ciphers used by FastAPI REST API
-DEFAULT_SSL_CIPHERS = "TLSv1"
+# Default SSL ciphers used by FastAPI REST API (matches IntermediateType profile
+# plus FIPS-compliant CBC ciphers for HAProxy reencrypt route compatibility)
+DEFAULT_SSL_CIPHERS = (
+    "TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256, "
+    "ECDHE-ECDSA-AES128-GCM-SHA256, ECDHE-RSA-AES128-GCM-SHA256, "
+    "ECDHE-ECDSA-AES256-GCM-SHA384, ECDHE-RSA-AES256-GCM-SHA384, "
+    "ECDHE-ECDSA-CHACHA20-POLY1305, ECDHE-RSA-CHACHA20-POLY1305, "
+    "DHE-RSA-AES128-GCM-SHA256, DHE-RSA-AES256-GCM-SHA384, "
+    "ECDHE-ECDSA-AES128-SHA256, ECDHE-RSA-AES128-SHA256, "
+    "ECDHE-ECDSA-AES256-SHA384, ECDHE-RSA-AES256-SHA384, "
+    "DHE-RSA-AES128-SHA256, DHE-RSA-AES256-SHA256"
+)
 
 # Default authentication module
 DEFAULT_AUTHENTICATION_MODULE = "k8s"
@@ -206,6 +216,9 @@ CONFIGURATION_DUMP_FILE_NAME = "configuration.json"
 # Environment variable containing configuration file name to override default
 # configuration file
 CONFIGURATION_FILE_NAME_ENV_VARIABLE = "OLS_CONFIG_FILE"
+
+# Service name used in OpenAPI specification
+SERVICE_NAME = "OpenShift LightSpeed"
 
 # Response streaming media types
 MEDIA_TYPE_TEXT = "text/plain"

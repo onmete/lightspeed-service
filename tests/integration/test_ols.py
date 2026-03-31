@@ -22,6 +22,7 @@ from ols.app.models.config import (
 from ols.utils import suid
 from ols.utils.errors_parsing import DEFAULT_ERROR_MESSAGE, DEFAULT_STATUS_CODE
 from ols.utils.logging_configurator import configure_logging
+from ols.utils.token_handler import PromptTooLongError
 from tests.mock_classes.mock_langchain_interface import mock_langchain_interface
 from tests.mock_classes.mock_llm_loader import mock_llm_loader
 from tests.mock_classes.mock_tools import NAMESPACES_OUTPUT, mock_tools_map
@@ -81,16 +82,13 @@ def test_post_question_without_payload(_setup, endpoint):
 @pytest.mark.parametrize("endpoint", ("/v1/query", "/v1/streaming_query"))
 def test_post_question_on_generic_response_type_summarize_error(_setup, endpoint):
     """Check the REST API query endpoints when generic response type is returned."""
-    with (
-        patch(
-            "ols.src.query_helpers.docs_summarizer.DocsSummarizer.create_response",
-            side_effect=Exception("summarizer error"),
-        ),
-        patch(
-            "ols.src.query_helpers.docs_summarizer.DocsSummarizer.generate_response",
-            side_effect=Exception("summarizer error"),
-        ),
-    ):
+    with patch("ols.app.endpoints.ols.DocsSummarizer") as mock_docs_summarizer:
+        mock_docs_summarizer.return_value.create_response.side_effect = Exception(
+            "summarizer error"
+        )
+        mock_docs_summarizer.return_value.generate_response.side_effect = Exception(
+            "summarizer error"
+        )
         conversation_id = suid.get_suid()
         response = pytest.client.post(
             endpoint,
@@ -116,7 +114,7 @@ def test_post_question_with_provider_but_not_model(_setup, endpoint):
         json={
             "conversation_id": conversation_id,
             "query": "test query",
-            "provider": constants.PROVIDER_BAM,
+            "provider": constants.PROVIDER_OPENAI,
         },
     )
     assert response.status_code == requests.codes.unprocessable
@@ -217,7 +215,7 @@ def test_post_question_improper_conversation_id(_setup, endpoint) -> None:
         },
     )
     # error should be returned
-    assert response.status_code == requests.codes.internal_server_error
+    assert response.status_code == requests.codes.bad_request
     expected_details = {
         "detail": {
             "cause": "Invalid conversation ID not-correct-uuid",
@@ -231,12 +229,9 @@ def test_post_question_improper_conversation_id(_setup, endpoint) -> None:
 def test_post_question_on_noyaml_response_type(_setup, endpoint) -> None:
     """Check the REST API query endpoints when call is success."""
     ml = mock_langchain_interface("test response")
-    with (
-        patch("ols.customize.prompts.QUERY_SYSTEM_INSTRUCTION", "System Instruction"),
-        patch(
-            "ols.src.query_helpers.query_helper.load_llm",
-            new=mock_llm_loader(ml()),
-        ),
+    with patch(
+        "ols.src.query_helpers.query_helper.load_llm",
+        new=mock_llm_loader(ml()),
     ):
         conversation_id = suid.get_suid()
         response = pytest.client.post(
@@ -264,38 +259,33 @@ def test_post_query_with_query_filters_response_type(_setup, endpoint) -> None:
     ]
     config.ols_config.query_filters = query_filters
 
-    with (
-        patch("ols.customize.prompts.QUERY_SYSTEM_INSTRUCTION", "System Instruction"),
+    ml = mock_langchain_interface("test response")
+    with patch(
+        "ols.src.query_helpers.query_helper.load_llm",
+        new=mock_llm_loader(ml()),
     ):
-        ml = mock_langchain_interface("test response")
-        with (
-            patch(
-                "ols.src.query_helpers.query_helper.load_llm",
-                new=mock_llm_loader(ml()),
-            ),
-        ):
-            conversation_id = suid.get_suid()
-            response = pytest.client.post(
-                endpoint,
-                json={
-                    "conversation_id": conversation_id,
-                    "query": "test query with 9.25.33.67 will be replaced with redacted_ip",
-                },
-            )
+        conversation_id = suid.get_suid()
+        response = pytest.client.post(
+            endpoint,
+            json={
+                "conversation_id": conversation_id,
+                "query": "test query with 9.25.33.67 will be replaced with redacted_ip",
+            },
+        )
 
-            assert response.status_code == requests.codes.ok
+        assert response.status_code == requests.codes.ok
 
-            if response.headers["content-type"] == "application/json":
-                # non-streaming responses return JSON
-                actual_response = response.json()["response"]
-            else:
-                # streaming_query returns bytes
-                actual_response = response.text
+        if response.headers["content-type"] == "application/json":
+            # non-streaming responses return JSON
+            actual_response = response.json()["response"]
+        else:
+            # streaming_query returns bytes
+            actual_response = response.text
 
-            assert (
-                "test query with redacted_ip will be replaced with redacted_ip"
-                in actual_response
-            )
+        assert (
+            "test query with redacted_ip will be replaced with redacted_ip"
+            in actual_response
+        )
 
 
 @pytest.mark.parametrize("endpoint", ("/v1/query", "/v1/streaming_query"))
@@ -304,26 +294,30 @@ def test_post_query_for_conversation_history(_setup, endpoint) -> None:
     # we need to import it here because these modules triggers config
     # load too -> causes exception in auth module because of missing config
     # values
-    from ols.app.endpoints.ols import retrieve_previous_input  # pylint: disable=C0415
     from ols.app.models.models import CacheEntry  # pylint: disable=C0415
 
+    # Store original method
+    original_get = config.conversation_cache.get
     actual_returned_history = []
 
-    def capture_return_value(*args, **kwargs):
+    def capture_cache_get(*args, **kwargs):
+        """Capture what the cache returns."""
         nonlocal actual_returned_history
-        actual_returned_history = retrieve_previous_input(*args, **kwargs)
-        return actual_returned_history
+        # Call the original cache.get() and capture its return
+        result = original_get(*args, **kwargs)
+        actual_returned_history = result or []
+        return result
 
     ml = mock_langchain_interface("test response")
     with (
-        patch("ols.customize.prompts.QUERY_SYSTEM_INSTRUCTION", "System Instruction"),
         patch(
             "ols.src.query_helpers.query_helper.load_llm",
             new=mock_llm_loader(ml()),
         ),
-        patch(
-            "ols.app.endpoints.ols.retrieve_previous_input",
-            side_effect=capture_return_value,
+        patch.object(
+            config.conversation_cache,
+            "get",
+            side_effect=capture_cache_get,
         ),
     ):
         conversation_id = suid.get_suid()
@@ -378,12 +372,9 @@ def test_post_question_without_attachments(_setup, endpoint) -> None:
         query_passed = result
         return result
 
-    with (
-        patch("ols.customize.prompts.QUERY_SYSTEM_INSTRUCTION", "System Instruction"),
-        patch(
-            "ols.app.endpoints.ols.append_attachments_to_query",
-            side_effect=capture_append,
-        ),
+    with patch(
+        "ols.app.endpoints.ols.append_attachments_to_query",
+        side_effect=capture_append,
     ):
         ml = mock_langchain_interface("test response")
         with patch(
@@ -418,12 +409,9 @@ def test_post_question_with_empty_list_of_attachments(_setup, endpoint) -> None:
         query_passed = result
         return result
 
-    with (
-        patch("ols.customize.prompts.QUERY_SYSTEM_INSTRUCTION", "System Instruction"),
-        patch(
-            "ols.app.endpoints.ols.append_attachments_to_query",
-            side_effect=capture_append,
-        ),
+    with patch(
+        "ols.app.endpoints.ols.append_attachments_to_query",
+        side_effect=capture_append,
     ):
         ml = mock_langchain_interface("test response")
         with patch(
@@ -459,12 +447,9 @@ def test_post_question_with_one_plaintext_attachment(_setup, endpoint) -> None:
         query_passed = result
         return result
 
-    with (
-        patch("ols.customize.prompts.QUERY_SYSTEM_INSTRUCTION", "System Instruction"),
-        patch(
-            "ols.app.endpoints.ols.append_attachments_to_query",
-            side_effect=capture_append,
-        ),
+    with patch(
+        "ols.app.endpoints.ols.append_attachments_to_query",
+        side_effect=capture_append,
     ):
         ml = mock_langchain_interface("test response")
         with patch(
@@ -513,12 +498,9 @@ def test_post_question_with_one_yaml_attachment(_setup, endpoint) -> None:
         query_passed = result
         return result
 
-    with (
-        patch("ols.customize.prompts.QUERY_SYSTEM_INSTRUCTION", "System Instruction"),
-        patch(
-            "ols.app.endpoints.ols.append_attachments_to_query",
-            side_effect=capture_append,
-        ),
+    with patch(
+        "ols.app.endpoints.ols.append_attachments_to_query",
+        side_effect=capture_append,
     ):
         ml = mock_langchain_interface("test response")
         with patch(
@@ -576,12 +558,9 @@ def test_post_question_with_two_yaml_attachments(_setup, endpoint) -> None:
         query_passed = result
         return result
 
-    with (
-        patch("ols.customize.prompts.QUERY_SYSTEM_INSTRUCTION", "System Instruction"),
-        patch(
-            "ols.app.endpoints.ols.append_attachments_to_query",
-            side_effect=capture_append,
-        ),
+    with patch(
+        "ols.app.endpoints.ols.append_attachments_to_query",
+        side_effect=capture_append,
     ):
         ml = mock_langchain_interface("test response")
         with patch(
@@ -659,12 +638,9 @@ def test_post_question_with_one_yaml_without_kind_attachment(_setup, endpoint) -
         query_passed = result
         return result
 
-    with (
-        patch("ols.customize.prompts.QUERY_SYSTEM_INSTRUCTION", "System Instruction"),
-        patch(
-            "ols.app.endpoints.ols.append_attachments_to_query",
-            side_effect=capture_append,
-        ),
+    with patch(
+        "ols.app.endpoints.ols.append_attachments_to_query",
+        side_effect=capture_append,
     ):
         ml = mock_langchain_interface("test response")
         with patch(
@@ -720,12 +696,9 @@ def test_post_question_with_one_yaml_without_name_attachment(_setup, endpoint) -
         query_passed = result
         return result
 
-    with (
-        patch("ols.customize.prompts.QUERY_SYSTEM_INSTRUCTION", "System Instruction"),
-        patch(
-            "ols.app.endpoints.ols.append_attachments_to_query",
-            side_effect=capture_append,
-        ),
+    with patch(
+        "ols.app.endpoints.ols.append_attachments_to_query",
+        side_effect=capture_append,
     ):
         ml = mock_langchain_interface("test response")
         with patch(
@@ -783,12 +756,9 @@ def test_post_question_with_one_invalid_yaml_attachment(_setup, endpoint) -> Non
         query_passed = result
         return result
 
-    with (
-        patch("ols.customize.prompts.QUERY_SYSTEM_INSTRUCTION", "System Instruction"),
-        patch(
-            "ols.app.endpoints.ols.append_attachments_to_query",
-            side_effect=capture_append,
-        ),
+    with patch(
+        "ols.app.endpoints.ols.append_attachments_to_query",
+        side_effect=capture_append,
     ):
         ml = mock_langchain_interface("test response")
         with patch(
@@ -879,11 +849,18 @@ logs:
 def test_post_too_long_query(_setup, endpoint):
     """Check the REST API query endpoints for query that is too long."""
     query = "test query" * 1000
-    conversation_id = suid.get_suid()
-    response = pytest.client.post(
-        endpoint,
-        json={"conversation_id": conversation_id, "query": query},
-    )
+    with patch("ols.app.endpoints.ols.DocsSummarizer") as mock_docs_summarizer:
+        mock_docs_summarizer.return_value.create_response.side_effect = (
+            PromptTooLongError("test query exceeds LLM available context window limit")
+        )
+        mock_docs_summarizer.return_value.generate_response.side_effect = (
+            PromptTooLongError("test query exceeds LLM available context window limit")
+        )
+        conversation_id = suid.get_suid()
+        response = pytest.client.post(
+            endpoint,
+            json={"conversation_id": conversation_id, "query": query},
+        )
 
     if response.headers["content-type"] == "application/json":
         # non-streaming responses return JSON
@@ -944,12 +921,9 @@ def test_post_with_system_prompt_override_disabled(_setup, caplog):
     """Check the POST /v1/query API with a system prompt when overriding is disabled."""
     query = "test query"
     system_prompt = "You are an expert in something marvelous."
-    with (
-        patch("ols.customize.prompts.QUERY_SYSTEM_INSTRUCTION", "System Instruction"),
-        patch(
-            "ols.app.endpoints.ols.config.dev_config.enable_system_prompt_override",
-            False,
-        ),
+    with patch(
+        "ols.app.endpoints.ols.config.dev_config.enable_system_prompt_override",
+        False,
     ):
         _post_with_system_prompt_override(_setup, caplog, query, system_prompt)
 
@@ -1010,7 +984,6 @@ def test_tool_calling(_setup, caplog) -> None:
     mcp_servers = {"fake-server": {"transport": "http", "url": "http://fake-server"}}
 
     with (
-        patch("ols.customize.prompts.QUERY_SYSTEM_INSTRUCTION", "System Instruction"),
         patch("ols.utils.mcp_utils.config") as mock_config,
         patch("ols.utils.mcp_utils.MultiServerMCPClient") as mock_mcp_client_cls,
         patch(
@@ -1025,6 +998,11 @@ def test_tool_calling(_setup, caplog) -> None:
         # Mock config for get_mcp_tools
         mock_config.tools_rag = None
         mock_config.mcp_servers.servers = [MagicMock()]  # Non-empty list
+
+        # Set tool budget on model config (normally computed by AppConfig when MCP is configured)
+        config.config.llm_providers.providers["p1"].models[
+            "m1"
+        ].max_tokens_for_tools = 2000
 
         # Mock _gather_and_populate_tools to return tools
         with patch(

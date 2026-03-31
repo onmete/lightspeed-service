@@ -23,25 +23,6 @@ cache_entry_2 = CacheEntry(
 )
 
 
-def test_init_cache_failure_detection():
-    """Test the exception handling for Cache.initialize_cache operation."""
-    exception_message = "Exception during initializing the cache."
-
-    # do not use real PostgreSQL instance
-    with patch("psycopg2.connect") as mock_connect:
-        mock_connect.return_value.cursor.return_value.execute.side_effect = Exception(
-            exception_message
-        )
-
-        # try to connect to mocked Postgres
-        config = PostgresConfig()
-        with pytest.raises(Exception, match=exception_message):
-            PostgresCache(config)
-
-        # connection must be closed in case of exception
-        mock_connect.return_value.close.assert_called_once_with()
-
-
 def test_get_operation_on_empty_cache():
     """Test the Cache.get operation on empty cache."""
     # mock the query result - empty cache
@@ -235,6 +216,10 @@ def test_insert_or_append_operation():
     # multiple DB operations must be performed:
     calls = [
         call(
+            PostgresCache.ADVISORY_LOCK_STATEMENT,
+            (user_id, conversation_id),
+        ),
+        call(
             PostgresCache.SELECT_CONVERSATION_HISTORY_STATEMENT,
             (user_id, conversation_id),
         ),
@@ -285,6 +270,10 @@ def test_insert_or_append_operation_append_item():
 
     # multiple DB operations must be performed:
     calls = [
+        call(
+            PostgresCache.ADVISORY_LOCK_STATEMENT,
+            (user_id, conversation_id),
+        ),
         call(
             PostgresCache.SELECT_CONVERSATION_HISTORY_STATEMENT,
             (user_id, conversation_id),
@@ -352,6 +341,10 @@ def test_insert_or_append_operation_on_disconnected_db():
     # multiple DB operations must be performed:
     calls = [
         call(
+            PostgresCache.ADVISORY_LOCK_STATEMENT,
+            (user_id, conversation_id),
+        ),
+        call(
             PostgresCache.SELECT_CONVERSATION_HISTORY_STATEMENT,
             (user_id, conversation_id),
         ),
@@ -367,6 +360,50 @@ def test_insert_or_append_operation_on_disconnected_db():
         call("SELECT 1"),
     ]
     mock_cursor.execute.assert_has_calls(calls, any_order=False)
+
+
+def test_insert_or_append_transaction_management():
+    """Test that insert_or_append commits on success and restores autocommit."""
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = None
+
+    with patch("psycopg2.connect") as mock_connect:
+        mock_connect.return_value.cursor.return_value.__enter__.return_value = (
+            mock_cursor
+        )
+
+        config = PostgresConfig()
+        cache = PostgresCache(config)
+        commit_count_before = mock_connect.return_value.commit.call_count
+
+        cache.insert_or_append(user_id, conversation_id, cache_entry_1)
+
+    assert mock_connect.return_value.commit.call_count == commit_count_before + 1
+    mock_connect.return_value.rollback.assert_not_called()
+    assert mock_connect.return_value.autocommit is True
+
+
+def test_insert_or_append_rollback_on_error():
+    """Test that insert_or_append rolls back on error and restores autocommit."""
+    mock_cursor = MagicMock()
+    mock_cursor.execute.side_effect = [
+        None,  # SELECT 1 (connection check)
+        psycopg2.DatabaseError("insert failed"),  # advisory lock
+    ]
+
+    with patch("psycopg2.connect") as mock_connect:
+        mock_connect.return_value.cursor.return_value.__enter__.return_value = (
+            mock_cursor
+        )
+
+        config = PostgresConfig()
+        cache = PostgresCache(config)
+
+        with pytest.raises(CacheError, match="insert failed"):
+            cache.insert_or_append(user_id, conversation_id, cache_entry_1)
+
+    mock_connect.return_value.rollback.assert_called_once()
+    assert mock_connect.return_value.autocommit is True
 
 
 def test_list_operation():
@@ -648,6 +685,51 @@ def test_delete_operation_on_disconnected_db():
         ),
     ]
     mock_cursor.execute.assert_has_calls(calls, any_order=False)
+
+
+def test_delete_transaction_management():
+    """Test that delete commits on success and restores autocommit."""
+    mock_cursor = MagicMock()
+    mock_cursor.rowcount = 1
+
+    with patch("psycopg2.connect") as mock_connect:
+        mock_connect.return_value.cursor.return_value.__enter__.return_value = (
+            mock_cursor
+        )
+
+        config = PostgresConfig()
+        cache = PostgresCache(config)
+        commit_count_before = mock_connect.return_value.commit.call_count
+
+        result = cache.delete(user_id, conversation_id)
+
+    assert result is True
+    assert mock_connect.return_value.commit.call_count == commit_count_before + 1
+    mock_connect.return_value.rollback.assert_not_called()
+    assert mock_connect.return_value.autocommit is True
+
+
+def test_delete_rollback_on_error():
+    """Test that delete rolls back on error and restores autocommit."""
+    mock_cursor = MagicMock()
+    mock_cursor.execute.side_effect = [
+        None,  # SELECT 1 (connection check)
+        psycopg2.DatabaseError("delete failed"),  # DELETE statement
+    ]
+
+    with patch("psycopg2.connect") as mock_connect:
+        mock_connect.return_value.cursor.return_value.__enter__.return_value = (
+            mock_cursor
+        )
+
+        config = PostgresConfig()
+        cache = PostgresCache(config)
+
+        with pytest.raises(CacheError, match="delete failed"):
+            cache.delete(user_id, conversation_id)
+
+    mock_connect.return_value.rollback.assert_called_once()
+    assert mock_connect.return_value.autocommit is True
 
 
 def test_cleanup_method_when_clean_not_needed():

@@ -2,6 +2,7 @@
 
 import json
 import logging
+import threading
 from typing import Any
 
 import psycopg2
@@ -15,12 +16,12 @@ from ols.app.models.models import (
 )
 from ols.src.cache.cache import Cache
 from ols.src.cache.cache_error import CacheError
-from ols.utils.connection_decorator import connection
+from ols.utils.postgres import PostgresBase, connection
 
 logger = logging.getLogger(__name__)
 
 
-class PostgresCache(Cache):
+class PostgresCache(Cache, PostgresBase):
     """Cache that uses Postgres to store cached values.
 
     The cache itself is stored in following tables:
@@ -152,70 +153,18 @@ class PostgresCache(Cache):
 
     def __init__(self, config: PostgresConfig) -> None:
         """Create a new instance of Postgres cache."""
-        self.postgres_config = config
-
-        # initialize connection to DB
-        self.connect()
+        self._tx_lock = threading.Lock()
         self.capacity = config.max_entries
+        super().__init__(config)
 
-    # pylint: disable=W0201
-    def connect(self) -> None:
-        """Initialize connection to database."""
-        logger.info("Connecting to storage")
-        # make sure the connection will have known state
-        # even if PG is not alive
-        self.connection = None
-        config = self.postgres_config
-        self.connection = psycopg2.connect(
-            host=config.host,
-            port=config.port,
-            user=config.user,
-            password=config.password,
-            dbname=config.dbname,
-            sslmode=config.ssl_mode,
-            sslrootcert=config.ca_cert_path,
-            gssencmode=config.gss_encmode,
-        )
-        try:
-            self.initialize_cache()
-        except Exception as e:
-            self.connection.close()
-            logger.exception("Error initializing Postgres cache:\n%s", e)
-            raise
-        self.connection.autocommit = True
-
-    def connected(self) -> bool:
-        """Check if connection to cache is alive."""
-        if self.connection is None:
-            logger.warning("Not connected, need to reconnect later")
-            return False
-        try:
-            with self.connection.cursor() as cursor:
-                cursor.execute("SELECT 1")
-            logger.info("Connection to storage is ok")
-            return True
-        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
-            logger.error("Disconnected from storage: %s", e)
-            return False
-
-    def initialize_cache(self) -> None:
-        """Initialize cache - clean it up etc."""
-        # cursor as context manager is not used there on purpose
-        # any CREATE statement can raise it's own exception
-        # and it should not interfere with other statements
-        cursor = self.connection.cursor()
-
-        logger.info("Initializing table for cache")
-        cursor.execute(PostgresCache.CREATE_CACHE_TABLE)
-
-        logger.info("Initializing table for conversations metadata")
-        cursor.execute(PostgresCache.CREATE_CONVERSATIONS_TABLE)
-
-        logger.info("Initializing index for cache")
-        cursor.execute(PostgresCache.CREATE_INDEX)
-
-        cursor.close()
-        self.connection.commit()
+    @property
+    def _ddl_statements(self) -> list[str]:
+        """Return DDL statements for cache tables and indexes."""
+        return [
+            self.CREATE_CACHE_TABLE,
+            self.CREATE_CONVERSATIONS_TABLE,
+            self.CREATE_INDEX,
+        ]
 
     @connection
     def get(
@@ -234,16 +183,17 @@ class PostgresCache(Cache):
         # just check if user_id and conversation_id are UUIDs
         super().construct_key(user_id, conversation_id, skip_user_id_check)
 
-        with self.connection.cursor() as cursor:
-            try:
-                value = PostgresCache._select(cursor, user_id, conversation_id)
-                if value is None:
-                    return []
-                history = [CacheEntry.from_dict(cache_entry) for cache_entry in value]
-                return history
-            except psycopg2.DatabaseError as e:
-                logger.error("PostgresCache.get %s", e)
-                raise CacheError("PostgresCache.get", e) from e
+        with self._tx_lock:
+            with self.connection.cursor() as cursor:
+                try:
+                    value = PostgresCache._select(cursor, user_id, conversation_id)
+                    if value is None:
+                        return []
+                    history = [CacheEntry.from_dict(ce) for ce in value]
+                    return history
+                except psycopg2.DatabaseError as e:
+                    logger.error("PostgresCache.get %s", e)
+                    raise CacheError("PostgresCache.get", e) from e
 
     @connection
     def insert_or_append(
@@ -263,39 +213,46 @@ class PostgresCache(Cache):
 
         """
         value = cache_entry.to_dict()
-        # the whole operation is run in one transaction
-        with self.connection.cursor() as cursor:
-            try:
-                cursor.execute(
-                    self.ADVISORY_LOCK_STATEMENT,
-                    (user_id, conversation_id),
-                )
-                old_value = self._select(cursor, user_id, conversation_id)
-                if old_value:
-                    old_value.append(value)
-                    PostgresCache._update(
-                        cursor,
-                        user_id,
-                        conversation_id,
-                        json.dumps(old_value, cls=MessageEncoder).encode("utf-8"),
+        # autocommit=True makes each execute() its own transaction, so
+        # pg_advisory_xact_lock would be released immediately after the first
+        # execute.  Disable autocommit for a real multi-statement transaction.
+        # The lock serialises concurrent callers that share this connection.
+        with self._tx_lock:
+            self.connection.autocommit = False
+            with self.connection.cursor() as cursor:
+                try:
+                    cursor.execute(
+                        self.ADVISORY_LOCK_STATEMENT,
+                        (user_id, conversation_id),
                     )
-                else:
-                    PostgresCache._insert(
-                        cursor,
-                        user_id,
-                        conversation_id,
-                        json.dumps([value], cls=MessageEncoder).encode("utf-8"),
+                    old_value = self._select(cursor, user_id, conversation_id)
+                    if old_value:
+                        old_value.append(value)
+                        PostgresCache._update(
+                            cursor,
+                            user_id,
+                            conversation_id,
+                            json.dumps(old_value, cls=MessageEncoder).encode("utf-8"),
+                        )
+                    else:
+                        PostgresCache._insert(
+                            cursor,
+                            user_id,
+                            conversation_id,
+                            json.dumps([value], cls=MessageEncoder).encode("utf-8"),
+                        )
+                    cursor.execute(
+                        PostgresCache.UPSERT_CONVERSATION_STATEMENT,
+                        (user_id, conversation_id),
                     )
-                # Update conversations metadata table
-                cursor.execute(
-                    PostgresCache.UPSERT_CONVERSATION_STATEMENT,
-                    (user_id, conversation_id),
-                )
-                PostgresCache._cleanup(cursor, self.capacity)
-                # commit is implicit at this point
-            except psycopg2.DatabaseError as e:
-                logger.error("PostgresCache.insert_or_append: %s", e)
-                raise CacheError("PostgresCache.insert_or_append", e) from e
+                    PostgresCache._cleanup(cursor, self.capacity)
+                    self.connection.commit()
+                except psycopg2.DatabaseError as e:
+                    self.connection.rollback()
+                    logger.error("PostgresCache.insert_or_append: %s", e)
+                    raise CacheError("PostgresCache.insert_or_append", e) from e
+                finally:
+                    self.connection.autocommit = True
 
     @connection
     def delete(
@@ -312,18 +269,23 @@ class PostgresCache(Cache):
             bool: True if the conversation was deleted, False if not found.
 
         """
-        with self.connection.cursor() as cursor:
-            try:
-                deleted = PostgresCache._delete(cursor, user_id, conversation_id)
-                # Also delete from conversations metadata table
-                cursor.execute(
-                    PostgresCache.DELETE_CONVERSATION_METADATA_STATEMENT,
-                    (user_id, conversation_id),
-                )
-                return deleted
-            except psycopg2.DatabaseError as e:
-                logger.error("PostgresCache.delete: %s", e)
-                raise CacheError("PostgresCache.delete", e) from e
+        with self._tx_lock:
+            self.connection.autocommit = False
+            with self.connection.cursor() as cursor:
+                try:
+                    deleted = PostgresCache._delete(cursor, user_id, conversation_id)
+                    cursor.execute(
+                        PostgresCache.DELETE_CONVERSATION_METADATA_STATEMENT,
+                        (user_id, conversation_id),
+                    )
+                    self.connection.commit()
+                    return deleted
+                except psycopg2.DatabaseError as e:
+                    self.connection.rollback()
+                    logger.error("PostgresCache.delete: %s", e)
+                    raise CacheError("PostgresCache.delete", e) from e
+                finally:
+                    self.connection.autocommit = True
 
     @connection
     def list(
@@ -340,22 +302,25 @@ class PostgresCache(Cache):
             topic_summary, last_message_timestamp, and message_count.
 
         """
-        with self.connection.cursor() as cursor:
-            try:
-                cursor.execute(PostgresCache.LIST_CONVERSATIONS_STATEMENT, (user_id,))
-                rows = cursor.fetchall()
-                return [
-                    ConversationData(
-                        conversation_id=row[0],
-                        topic_summary=row[1] or "",
-                        last_message_timestamp=float(row[2]),
-                        message_count=row[3] or 0,
+        with self._tx_lock:
+            with self.connection.cursor() as cursor:
+                try:
+                    cursor.execute(
+                        PostgresCache.LIST_CONVERSATIONS_STATEMENT, (user_id,)
                     )
-                    for row in rows
-                ]
-            except psycopg2.DatabaseError as e:
-                logger.error("PostgresCache.list: %s", e)
-                raise CacheError("PostgresCache.list", e) from e
+                    rows = cursor.fetchall()
+                    return [
+                        ConversationData(
+                            conversation_id=row[0],
+                            topic_summary=row[1] or "",
+                            last_message_timestamp=float(row[2]),
+                            message_count=row[3] or 0,
+                        )
+                        for row in rows
+                    ]
+                except psycopg2.DatabaseError as e:
+                    logger.error("PostgresCache.list: %s", e)
+                    raise CacheError("PostgresCache.list", e) from e
 
     @connection
     def set_topic_summary(
@@ -373,15 +338,16 @@ class PostgresCache(Cache):
             topic_summary: The topic summary to store.
             skip_user_id_check: Skip user_id suid check.
         """
-        with self.connection.cursor() as cursor:
-            try:
-                cursor.execute(
-                    PostgresCache.INSERT_OR_UPDATE_TOPIC_SUMMARY_STATEMENT,
-                    (user_id, conversation_id, topic_summary),
-                )
-            except psycopg2.DatabaseError as e:
-                logger.error("PostgresCache.set_topic_summary: %s", e)
-                raise CacheError("PostgresCache.set_topic_summary", e) from e
+        with self._tx_lock:
+            with self.connection.cursor() as cursor:
+                try:
+                    cursor.execute(
+                        PostgresCache.INSERT_OR_UPDATE_TOPIC_SUMMARY_STATEMENT,
+                        (user_id, conversation_id, topic_summary),
+                    )
+                except psycopg2.DatabaseError as e:
+                    logger.error("PostgresCache.set_topic_summary: %s", e)
+                    raise CacheError("PostgresCache.set_topic_summary", e) from e
 
     def ready(self) -> bool:
         """Check if the cache is ready.

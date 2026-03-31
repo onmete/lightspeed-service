@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import traceback
 from functools import cached_property
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 import yaml
@@ -16,14 +18,18 @@ from ols.src.quota.token_usage_history import TokenUsageHistory
 # as the index_loader.py is excluded from type checks, it confuses
 # mypy a bit, hence the [attr-defined] bellow
 from ols.src.rag_index.index_loader import IndexLoader  # type: ignore [attr-defined]
+from ols.src.skills.skills_rag import SkillsRAG, load_skills_from_directory
 from ols.src.tools.tools_rag.hybrid_tools_rag import ToolsRAG
 from ols.utils.redactor import Redactor
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from io import TextIOBase
 
     from ols.src.cache.cache import Cache
     from ols.src.quota.quota_limiter import QuotaLimiter
+    from ols.src.tools.approval import PendingApprovalStoreBase
 
 
 class AppConfig:
@@ -47,6 +53,7 @@ class AppConfig:
         self._token_usage_history: Optional[TokenUsageHistory] = None
         self.k8s_tools_resolved = False
         self._tools_approval: Optional[config_model.ToolsApprovalConfig] = None
+        self._pending_approval_store: Optional["PendingApprovalStoreBase"] = None
 
     @property
     def llm_config(self) -> config_model.LLMProviders:
@@ -91,6 +98,17 @@ class AppConfig:
                 self.ols_config.conversation_cache
             )
         return self._conversation_cache
+
+    @property
+    def pending_approval_store(self) -> "PendingApprovalStoreBase":
+        """Return the pending approval store for tool approval flow."""
+        if self._pending_approval_store is None:
+            from ols.src.tools.approval import (  # pylint: disable=import-outside-toplevel
+                create_pending_approval_store,
+            )
+
+            self._pending_approval_store = create_pending_approval_store()
+        return self._pending_approval_store
 
     @property
     def quota_limiters(self) -> list[QuotaLimiter]:
@@ -139,6 +157,48 @@ class AppConfig:
             self._rag_index_loader = IndexLoader(self.ols_config.reference_content)
         return self._rag_index_loader
 
+    def _resolve_embed_model(self, embed_model_path: Optional[str] = None) -> Any:
+        """Resolve the embedding model for hybrid RAG (tools and skills).
+
+        Uses the RAG index loader's model when available (production/operator path).
+        Falls back to creating a HuggingFaceEmbedding from embed_model_path or the
+        default sentence-transformers model (local testing only).
+        """
+        from llama_index.embeddings.huggingface import (  # pylint: disable=import-outside-toplevel
+            HuggingFaceEmbedding,
+        )
+
+        # Suppress noisy progress bars and model load reports from HuggingFace.
+        for name in ("sentence_transformers", "transformers"):
+            logging.getLogger(name).setLevel(logging.ERROR)
+
+        # Local testing override -- not exposed by the operator.
+        if embed_model_path:
+            return HuggingFaceEmbedding(model_name=embed_model_path)
+
+        # Production path -- reuse the model from the RAG index loader.
+        embed_model = self.rag_index_loader.embed_model
+        if embed_model is not None and not isinstance(embed_model, str):
+            return embed_model
+
+        # Fallback when no RAG index is configured.
+        fallback_model = "sentence-transformers/all-mpnet-base-v2"
+        logger.warning(
+            "No embedding model from RAG index or config; "
+            "downloading '%s' from HuggingFace Hub",
+            fallback_model,
+        )
+        try:
+            return HuggingFaceEmbedding(model_name=fallback_model)
+        except Exception:
+            logger.exception(
+                "Failed to load fallback embedding model '%s'. "
+                "On disconnected clusters, configure embed_model_path "
+                "or ensure the RAG index provides an embedding model.",
+                fallback_model,
+            )
+            raise
+
     @cached_property
     def tools_rag(self) -> Optional[ToolsRAG]:
         """Return the ToolsRAG instance for tool filtering.
@@ -152,18 +212,7 @@ class AppConfig:
             and len(self.config.mcp_servers.servers) > 0
         ):
             tool_config = self.config.ols_config.tool_filtering
-            embed_model = self.rag_index_loader.embed_model
-            if embed_model is None or isinstance(embed_model, str):
-                from llama_index.embeddings.huggingface import (  # pylint: disable=import-outside-toplevel
-                    HuggingFaceEmbedding,
-                )
-
-                model_path = (
-                    tool_config.embed_model_path
-                    or "sentence-transformers/all-mpnet-base-v2"
-                )
-                embed_model = HuggingFaceEmbedding(model_name=model_path)
-
+            embed_model = self._resolve_embed_model(tool_config.embed_model_path)
             return ToolsRAG(
                 encode_fn=embed_model.get_text_embedding,
                 alpha=tool_config.alpha,
@@ -171,6 +220,37 @@ class AppConfig:
                 threshold=tool_config.threshold,
             )
         return None
+
+    @cached_property
+    def skills_rag(self) -> Optional[SkillsRAG]:
+        """Return the SkillsRAG instance for skill selection.
+
+        Only creates the instance if skills configuration exists. Loads skills
+        from the configured directory and populates the index eagerly.
+        """
+        skills_config = self.config.ols_config.skills
+        if skills_config is None:
+            return None
+
+        skills_dir = Path(skills_config.skills_dir)
+        if not skills_dir.is_dir():
+            logger.warning("Skills directory does not exist: %s", skills_dir)
+            return None
+
+        skills = load_skills_from_directory(skills_dir)
+        if not skills:
+            logger.warning("No skills found in %s", skills_dir)
+            return None
+
+        embed_model = self._resolve_embed_model(skills_config.embed_model_path)
+        rag = SkillsRAG(
+            encode_fn=embed_model.get_text_embedding,
+            alpha=skills_config.alpha,
+            threshold=skills_config.threshold,
+        )
+        rag.populate_skills(skills)
+
+        return rag
 
     @property
     def proxy_config(self) -> Optional[config_model.ProxyConfig]:
@@ -210,11 +290,14 @@ class AppConfig:
             self._query_filters = None
             self._rag_index_loader = None
             self._tools_approval = None
+            self._pending_approval_store = None
             # Clear cached_property if it exists
             if "mcp_servers_dict" in self.__dict__:
                 del self.__dict__["mcp_servers_dict"]
             if "tools_rag" in self.__dict__:
                 del self.__dict__["tools_rag"]
+            if "skills_rag" in self.__dict__:
+                del self.__dict__["skills_rag"]
         except Exception as e:
             print(f"Failed to load config file {config_file}: {e!s}")
             print(traceback.format_exc())

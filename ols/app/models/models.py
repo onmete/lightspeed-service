@@ -3,6 +3,7 @@
 import json
 from collections import OrderedDict
 from dataclasses import field
+from enum import StrEnum
 from typing import Any, Literal, Optional, Self, Union
 
 from langchain_core.language_models.llms import LLM
@@ -10,8 +11,8 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic.dataclasses import dataclass
 
-from ols.constants import MEDIA_TYPE_JSON, MEDIA_TYPE_TEXT
-from ols.customize import prompts
+from ols.constants import MEDIA_TYPE_JSON, MEDIA_TYPE_TEXT, QueryMode
+from ols.src.prompts.prompts import QUERY_SYSTEM_INSTRUCTION
 from ols.utils import suid
 
 
@@ -73,6 +74,7 @@ class LLMRequest(BaseModel):
         attachments: The optional attachments.
         media_type: The optional parameter for streaming response.
         mcp_headers: Optional JSON object mapping MCP server names to header lists.
+        mode: The query mode controlling which system prompt is used.
 
     Example:
         ```python
@@ -88,6 +90,7 @@ class LLMRequest(BaseModel):
     attachments: Optional[list[Attachment]] = None
     media_type: Optional[str] = MEDIA_TYPE_TEXT
     mcp_headers: Optional[dict[str, dict[str, str]]] = None
+    mode: QueryMode = QueryMode.ASK
 
     # provides examples for /docs endpoint
     model_config = {
@@ -99,7 +102,7 @@ class LLMRequest(BaseModel):
                     "conversation_id": "123e4567-e89b-12d3-a456-426614174000",
                     "provider": "openai",
                     "model": "model-name",
-                    "system_prompt": prompts.QUERY_SYSTEM_INSTRUCTION,
+                    "system_prompt": QUERY_SYSTEM_INSTRUCTION,
                     "attachments": [
                         {
                             "attachment_type": "log",
@@ -119,6 +122,7 @@ class LLMRequest(BaseModel):
                     ],
                     "media_type": "text/plain",
                     "mcp_headers": '{"github-mcp": {"Authorization": "Bearer ghp_xxxxx"}}',
+                    "mode": "ask",
                 }
             ]
         },
@@ -283,7 +287,7 @@ class ErrorResponse(BaseModel):
                 {
                     "detail": {
                         "response": "Error while validation question",
-                        "cause": "Failed to handle request to https://bam-api.res.ibm.com/v2/text",
+                        "cause": "Failed to handle request to https://api.openai.com/v1/chat/completions",
                     },
                 },
                 {
@@ -749,13 +753,15 @@ class TokenCounter:
     Attributes:
         llm: LLM instance
         input_tokens: number of tokens sent to LLM
-        output_tokens: number of tokens received from LLM
+        output_tokens: number of text tokens received from LLM
+        reasoning_tokens: number of reasoning summary tokens received from LLM
         llm_calls: number of LLM calls
     """
 
     llm: Optional[LLM] = None
     input_tokens: int = 0
     output_tokens: int = 0
+    reasoning_tokens: int = 0
     llm_calls: int = 0
 
 
@@ -965,21 +971,33 @@ class ProcessedRequest(BaseModel):
         user_id: The ID of the logged in user.
         conversation_id: Conversation ID.
         query_without_attachments: Query to LLM without attachments.
-        previous_input: Previous query to LLM.
         attachments: List of all attachments.
         timestamps: Timestamps for all operations.
         skip_user_id_check: Flag to skip user ID checking in handler.
         user_token: User token (if provided).
+        mode: The query mode controlling which system prompt is used.
     """
 
     user_id: str
     conversation_id: str
     query_without_attachments: str
-    previous_input: list[CacheEntry]
     attachments: list[Attachment]
     timestamps: dict[str, float]
     skip_user_id_check: bool
     user_token: str
+    mode: QueryMode
+
+
+class StreamChunkType(StrEnum):
+    """Supported streamed chunk types for query responses."""
+
+    TEXT = "text"
+    TOOL_CALL = "tool_call"
+    TOOL_RESULT = "tool_result"
+    HISTORY_COMPRESSION_START = "history_compression_start"
+    HISTORY_COMPRESSION_END = "history_compression_end"
+    END = "end"
+    REASONING = "reasoning"
 
 
 @dataclass
@@ -987,12 +1005,12 @@ class StreamedChunk:
     """Represents a chunk of streamed data from the LLM.
 
     Attributes:
-        type: The type of chunk (text, tool_call, tool_result, or end)
+        type: The type of chunk (text, tool_call, tool_result, history events, or end)
         text: The text content of the chunk (for text chunks)
         data: Additional data associated with the chunk (for non-text chunks)
     """
 
-    type: Literal["text", "tool_call", "tool_result", "end"]
+    type: StreamChunkType
     text: str = ""
     data: dict[str, Any] = field(default_factory=dict)
 
@@ -1099,3 +1117,27 @@ class MCPAppToolCallResponse(BaseModel):
     content: list[dict[str, Any]]
     structured_content: Optional[dict[str, Any]] = None
     is_error: bool = False
+
+
+class ToolApprovalDecisionRequest(BaseModel):
+    """Request payload to submit a tool-approval decision.
+
+    Attributes:
+        approval_id: Unique identifier of a pending approval request.
+        approved: True to approve tool execution, False to reject it.
+    """
+
+    approval_id: str
+    approved: bool
+
+    model_config = {
+        "extra": "forbid",
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "approval_id": "a89a5d3f-4bda-4eab-9f90-61d8e7b06dd2",
+                    "approved": True,
+                }
+            ]
+        },
+    }
