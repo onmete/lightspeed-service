@@ -5,25 +5,18 @@
 # pyright: reportAttributeAccessIssue=false
 
 import json
-import logging
 import os
-import tarfile
-import tempfile
-import uuid
 
 import pytest
 from httpx import Client
 from pytest import TestReport
-from reportportal_client import RPLogger
 
-from scripts.upload_artifact_s3 import upload_artifact_s3
 from tests.e2e.utils import client as client_utils
 from tests.e2e.utils import cluster, ols_installer
 from tests.e2e.utils.adapt_ols_config import adapt_ols_config
+from tests.e2e.utils.mcp_setup import setup_mcp_on_cluster, teardown_mcp_on_cluster
 from tests.e2e.utils.wait_for_ols import wait_for_ols
 from tests.scripts.must_gather import must_gather
-
-aws_env: dict[str, str] = {}
 
 # this flag is set to True when synthetic test report was already generated
 pytest.makereport_called = False
@@ -38,6 +31,19 @@ OLS_READY = False
 on_cluster: bool = False  # pylint: disable=C0103
 
 
+def _maybe_setup_mcp() -> None:
+    """Deploy mock MCP server and secret if running MCP test suite.
+
+    Must run before adapt_ols_config/install_ols so the mock server
+    is reachable and the secret exists when the operator reconciles the CR.
+    """
+    ols_config_suffix = os.getenv("OLS_CONFIG_SUFFIX", "default")
+    if "mcp" not in ols_config_suffix:
+        return
+    print("MCP test suite detected - deploying mock server and secret...")
+    setup_mcp_on_cluster()
+
+
 def pytest_sessionstart():
     """Set up common artifacts used by all e2e tests."""
     global OLS_READY  # pylint: disable=W0603
@@ -49,34 +55,49 @@ def pytest_sessionstart():
     if "localhost" not in ols_url:
         on_cluster = True
         try:
-            result = cluster.run_oc(
-                [
-                    "get",
-                    "clusterserviceversion",
-                    "-n",
-                    "openshift-lightspeed",
-                    "-o",
-                    "json",
-                ]
-            )
-            csv_data = json.loads(result.stdout)
-            print(csv_data)
+            _maybe_setup_mcp()
 
-            if not csv_data["items"]:
-                print("OLS Operator is not installed yet.")
-                ols_url, token, metrics_token = ols_installer.install_ols()
+            if os.getenv("SKIP_CLUSTER_SETUP", "false").lower() == "true":
+                print(
+                    "SKIP_CLUSTER_SETUP enabled - skipping OLS installation/configuration."
+                )
+                print("Using existing cluster setup...")
+                cluster.run_oc(
+                    ["project", "openshift-lightspeed"], ignore_existing_resource=True
+                )
+                ols_url = cluster.get_ols_url("ols")
+                token = cluster.get_token_for("test-user")
+                metrics_token = cluster.get_token_for("metrics-test-user")
+                print(f"Using OLS URL: {ols_url}")
             else:
-                print("OLS Operator is already installed. Skipping install.")
-                provider = os.getenv("PROVIDER", "openai")
-                creds = os.getenv("PROVIDER_KEY_PATH", "empty")
-                # create the llm api key secret ols will mount
-                provider_list = provider.split()
-                creds_list = creds.split()
-                for i, prov in enumerate(provider_list):
-                    ols_installer.create_secrets(
-                        prov, creds_list[i], len(provider_list)
-                    )
-                ols_url, token, metrics_token = adapt_ols_config()
+                result = cluster.run_oc(
+                    [
+                        "get",
+                        "clusterserviceversion",
+                        "-n",
+                        "openshift-lightspeed",
+                        "-o",
+                        "json",
+                    ]
+                )
+                csv_data = json.loads(result.stdout)
+                print(csv_data)
+
+                if not csv_data["items"]:
+                    print("OLS Operator is not installed yet.")
+                    ols_url, token, metrics_token = ols_installer.install_ols()
+                else:
+                    print("OLS Operator is already installed. Skipping install.")
+                    provider = os.getenv("PROVIDER", "openai")
+                    creds = os.getenv("PROVIDER_KEY_PATH", "empty")
+                    # create the llm api key secret ols will mount
+                    provider_list = provider.split()
+                    creds_list = creds.split()
+                    for i, prov in enumerate(provider_list):
+                        ols_installer.create_secrets(
+                            prov, creds_list[i], len(provider_list)
+                        )
+                    ols_url, token, metrics_token = adapt_ols_config()
 
         except Exception as e:
             print(f"Error setting up OLS on cluster: {e}")
@@ -152,6 +173,7 @@ def pytest_addoption(parser):
         default=[
             "watsonx+ibm/granite-4-h-small",
             "openai+gpt-4.1-mini",
+            "azure_openai+gpt-4.1-mini",
         ],
         type=str,
         help="Identifier for Provider/Model to be used for model eval.",
@@ -205,129 +227,44 @@ def pytest_addoption(parser):
         default=["ols"],
         help="Evaluation modes ex: with just prompt/rag etc.",
     )
-    parser.addoption(
-        "--rp_name",
-        action="store",
-        default="e2e-ols-cluster",
-        help="Enable report portal upload",
-    )
 
 
-@pytest.fixture(scope="session")
-def rp_logger():
-    """Set up logging for report portal.
+def pytest_collection_modifyitems(items: list) -> None:
+    """Filter and reorder collected tests.
 
-    Returns: logger
+    - Deselect mcp-marked tests when the MCP suite is not active.
+    - Ensure test_user_data_collection runs last in the data_export suite.
     """
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.DEBUG)
-    logging.setLoggerClass(RPLogger)
-    return logger
+    ols_config_suffix = os.getenv("OLS_CONFIG_SUFFIX", "default")
+    mcp_enabled = "mcp" in ols_config_suffix
+
+    selected = []
+    deselected = []
+    for item in items:
+        if not mcp_enabled and item.get_closest_marker("mcp"):
+            deselected.append(item)
+        else:
+            selected.append(item)
+
+    if deselected:
+        config = items[0].config
+        items[:] = selected
+        config.hook.pytest_deselected(items=deselected)
+
+    deferred = []
+    rest = []
+    for item in items:
+        if item.name == "test_user_data_collection":
+            deferred.append(item)
+        else:
+            rest.append(item)
+    items[:] = rest + deferred
 
 
-def write_json_to_temp_file(json_data):
-    """Write json to a temporary file.
-
-    Args:
-        json_data (dict): dict containing configuration from pytest.ini
-    Returns:
-        temporary file's name
-    """
-    with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
-        json.dump(json_data, temp_file)
-        temp_file.flush()
-        return temp_file.name
-
-
-def create_datarouter_config_file(session):
-    """Create datarouter config file."""
-    project = session.config.getini("rp_project")
-    assert (
-        project is not None
-    ), "create_datarouter_config_file: 'rp_project' attribute not found in session.config"
-
-    endpoint = session.config.getini("rp_endpoint")
-    assert (
-        endpoint is not None
-    ), "create_datarouter_config_file: 'rp_endpoint' attribute not found in session.config"
-
-    endpoint = endpoint.replace("https://", "")
-    launch = session.config.option.rp_name
-    launch_desc = session.config.getini("rp_launch_description") or ""
-    json_data = {
-        "targets": {
-            "reportportal": {
-                "config": {
-                    "hostname": endpoint,
-                    "project": project,
-                },
-                "processing": {
-                    "apply_tfa": True,
-                    "property_filter": ["^(?!(polarion|iqe_blocker).*$).*"],
-                    "launch": {
-                        "name": launch,
-                        "description": launch_desc,
-                    },
-                },
-            }
-        }
-    }
-
-    temp_filename = write_json_to_temp_file(json_data)
-    return temp_filename
-
-
-def add_secret_to_env(env) -> None:
-    """Add aws secrets from environment variable to dict.
-
-    Args:
-        env (env): environment variable name
-    Returns:
-        Null
-    """
-    name = env[:-5]
-    with open(os.environ[env], encoding="utf-8") as file:
-        content = file.read()
-        aws_env[name] = content
-
-
-def get_secret_value(env: str) -> str:
-    """Handle secrets delivered in env variables."""
-    with open(os.environ[env], encoding="utf-8") as file:
-        return file.read()
-
-
-def pytest_sessionfinish(session):
-    """Create datarouter compatible archive to upload into report portal."""
-    # Gather OLS artifacts for all test suites when running on cluster
+def pytest_sessionfinish():
+    """Gather OLS artifacts and clean up test resources after session finishes."""
     if on_cluster:
+        ols_config_suffix = os.getenv("OLS_CONFIG_SUFFIX", "default")
+        if "mcp" in ols_config_suffix:
+            teardown_mcp_on_cluster()
         must_gather()
-    # Sending reports to report portal
-    try:
-        datarouter_config = create_datarouter_config_file(session)
-        archive_path = os.path.join(os.getcwd(), f"reportportal-{uuid.uuid4()}.tar.gz")
-        with tarfile.open(archive_path, "w:gz") as tar:
-            tar.add(datarouter_config, arcname="data_router.json")
-            file_path = os.environ["ARTIFACT_DIR"]
-            for file in os.listdir(file_path):
-                if file.endswith(".xml"):
-                    print(f"Found xml to add in archive {file}.")
-                    tar.add(
-                        os.path.join(file_path, file),
-                        arcname=os.path.join("data", "results", file),
-                    )
-        print(f"Saved Report Portal datarouter archive to {archive_path}.")
-    except Exception as e:
-        print(f"Error creating RP archive: {e}")
-        return
-    try:
-        add_secret_to_env("AWS_ACCESS_KEY_ID_PATH")
-        add_secret_to_env("AWS_BUCKET_PATH")
-        add_secret_to_env("AWS_REGION_PATH")
-        add_secret_to_env("AWS_SECRET_ACCESS_KEY_PATH")
-        upload_artifact_s3(aws_env=aws_env)
-    except KeyError:
-        print(
-            "Could not find aws credentials to upload to S3. "
-            "Skipping reporting to Report portal."
-        )

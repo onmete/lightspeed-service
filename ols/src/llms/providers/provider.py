@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
+from google.oauth2 import service_account
 from ibm_watsonx_ai.metanames import GenTextParamsMetaNames as GenParams
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.language_models.llms import LLM
@@ -15,8 +16,9 @@ from ols import config
 from ols.app.models.config import ProviderConfig
 from ols.constants import (
     PROVIDER_AZURE_OPENAI,
-    PROVIDER_BAM,
     PROVIDER_FAKE,
+    PROVIDER_GOOGLE_VERTEX,
+    PROVIDER_GOOGLE_VERTEX_ANTHROPIC,
     PROVIDER_OPENAI,
     PROVIDER_RHELAI_VLLM,
     PROVIDER_RHOAI_VLLM,
@@ -70,6 +72,8 @@ OpenAIParameters = {
     ProviderParameter("verbose", bool),
     ProviderParameter("http_client", httpx.Client),
     ProviderParameter("http_async_client", httpx.AsyncClient),
+    ProviderParameter("reasoning", dict),
+    ProviderParameter("verbosity", str),
 }
 
 RHOAIVLLMParameters = {
@@ -104,17 +108,6 @@ RHELAIVLLMParameters = {
     ProviderParameter("http_async_client", httpx.AsyncClient),
 }
 
-BAMParameters = {
-    ProviderParameter("decoding_method", str),
-    ProviderParameter("max_new_tokens", int),
-    ProviderParameter("min_new_tokens", int),
-    ProviderParameter("random_seed", int),
-    ProviderParameter("top_k", int),
-    ProviderParameter("top_p", float),
-    ProviderParameter("repetition_penalty", float),
-    ProviderParameter("temperature", float),
-}
-
 WatsonxParameters = {
     ProviderParameter(GenParams.DECODING_METHOD, str),
     ProviderParameter(GenParams.MIN_NEW_TOKENS, int),
@@ -134,15 +127,39 @@ FakeProviderParameters = {
     ProviderParameter("sleep", float),
 }
 
+GoogleVertexAnthropicParameters = {
+    ProviderParameter("model_name", str),
+    ProviderParameter("project", str),
+    ProviderParameter("location", str),
+    ProviderParameter("credentials", service_account.Credentials),
+    ProviderParameter("max_output_tokens", int),
+    ProviderParameter("temperature", float),
+    ProviderParameter("top_p", float),
+    ProviderParameter("top_k", int),
+}
+
+GoogleVertexParameters = {
+    ProviderParameter("model", str),
+    ProviderParameter("project", str),
+    ProviderParameter("location", str),
+    ProviderParameter("vertexai", bool),
+    ProviderParameter("credentials", service_account.Credentials),
+    ProviderParameter("max_output_tokens", int),
+    ProviderParameter("temperature", float),
+    ProviderParameter("top_p", float),
+    ProviderParameter("top_k", int),
+}
+
 # available parameters for all supported LLM providers
 available_provider_parameters: dict[str, set[ProviderParameter]] = {
     PROVIDER_AZURE_OPENAI: AzureOpenAIParameters,
     PROVIDER_OPENAI: OpenAIParameters,
     PROVIDER_RHELAI_VLLM: RHELAIVLLMParameters,
     PROVIDER_RHOAI_VLLM: RHOAIVLLMParameters,
-    PROVIDER_BAM: BAMParameters,
     PROVIDER_WATSONX: WatsonxParameters,
     PROVIDER_FAKE: FakeProviderParameters,
+    PROVIDER_GOOGLE_VERTEX_ANTHROPIC: GoogleVertexAnthropicParameters,
+    PROVIDER_GOOGLE_VERTEX: GoogleVertexParameters,
 }
 
 # Generic to Azure OpenAI parameters mapping
@@ -165,12 +182,6 @@ RHOAIVLLMParametersMapping: dict[str, str] = {
     GenericLLMParameters.MAX_TOKENS_FOR_RESPONSE: "max_completion_tokens",
 }
 
-# Generic to BAM parameters mapping
-BAMParametersMapping: dict[str, str] = {
-    GenericLLMParameters.MIN_TOKENS_FOR_RESPONSE: "min_new_tokens",
-    GenericLLMParameters.MAX_TOKENS_FOR_RESPONSE: "max_new_tokens",
-}
-
 # Generic to Watsonx parameters mapping
 WatsonxParametersMapping: dict[str, str] = {
     GenericLLMParameters.MIN_TOKENS_FOR_RESPONSE: GenParams.MIN_NEW_TOKENS,
@@ -183,15 +194,25 @@ WatsonxParametersMapping: dict[str, str] = {
 # Generic to fake parameter mapping
 FakeProviderParametersMapping: dict[str, str] = {}
 
+# Generic to Google Vertex Anthropic parameters mapping
+GoogleVertexAnthropicParametersMapping: dict[str, str] = {
+    GenericLLMParameters.MAX_TOKENS_FOR_RESPONSE: "max_output_tokens",
+}
+
+GoogleVertexParametersMapping: dict[str, str] = {
+    GenericLLMParameters.MAX_TOKENS_FOR_RESPONSE: "max_output_tokens",
+}
+
 # mapping between generic parameters and LLM-specific parameters
 generic_to_llm_parameters: dict[str, dict[str, str]] = {
     PROVIDER_AZURE_OPENAI: AzureOpenAIParametersMapping,
     PROVIDER_OPENAI: OpenAIParametersMapping,
     PROVIDER_RHELAI_VLLM: RHELAIVLLMParametersMapping,
     PROVIDER_RHOAI_VLLM: RHOAIVLLMParametersMapping,
-    PROVIDER_BAM: BAMParametersMapping,
     PROVIDER_WATSONX: WatsonxParametersMapping,
     PROVIDER_FAKE: FakeProviderParametersMapping,
+    PROVIDER_GOOGLE_VERTEX_ANTHROPIC: GoogleVertexAnthropicParametersMapping,
+    PROVIDER_GOOGLE_VERTEX: GoogleVertexParametersMapping,
 }
 
 
@@ -392,8 +413,8 @@ class LLMProvider(AbstractLLMProvider):
                 "No security profiles. creating httpx.Client with verify %s", verify
             )
             if use_async:
-                return httpx.AsyncClient(verify=verify, proxies=proxy, mounts=mounts)
-            return httpx.Client(verify=verify, proxies=proxy, mounts=mounts)
+                return httpx.AsyncClient(verify=verify, proxy=proxy, mounts=mounts)
+            return httpx.Client(verify=verify, proxy=proxy, mounts=mounts)
 
         # security profile is set -> we need to retrieve SSL version and list of allowed ciphers
         ciphers = tls.ciphers_as_string(sec_profile.ciphers, sec_profile.profile_type)
@@ -421,5 +442,5 @@ class LLMProvider(AbstractLLMProvider):
             "With security profile, creating httpx.Client with verify %s", context
         )
         if use_async:
-            return httpx.AsyncClient(verify=context, proxies=proxy)
-        return httpx.Client(verify=context, proxies=proxy)
+            return httpx.AsyncClient(verify=context, proxy=proxy)
+        return httpx.Client(verify=context, proxy=proxy)

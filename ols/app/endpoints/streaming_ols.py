@@ -11,12 +11,10 @@ from typing import Any, AsyncGenerator, Generator, Optional, Union
 
 from fastapi import APIRouter, Depends, status
 from fastapi.responses import StreamingResponse
-from langchain_core.messages import ToolMessage
 
 from ols import config, constants
 from ols.app.endpoints.ols import (
-    calc_input_tokens,
-    calc_output_tokens,
+    calc_tokens,
     consume_tokens,
     generate_response,
     get_available_quotas,
@@ -32,6 +30,7 @@ from ols.app.models.models import (
     LLMRequest,
     RagChunk,
     ReferencedDocument,
+    StreamChunkType,
     StreamedChunk,
     SummarizerResponse,
     TokenCounter,
@@ -49,8 +48,11 @@ auth_dependency = get_auth_dependency(config.ols_config, virtual_path="/ols-acce
 
 
 LLM_TOKEN_EVENT = "token"  # noqa: S105
+LLM_REASONING_EVENT = "reasoning"
 LLM_TOOL_CALL_EVENT = "tool_call"
 LLM_TOOL_RESULT_EVENT = "tool_result"
+LLM_HISTORY_COMPRESSION_START_EVENT = StreamChunkType.HISTORY_COMPRESSION_START.value
+LLM_HISTORY_COMPRESSION_END_EVENT = StreamChunkType.HISTORY_COMPRESSION_END.value
 
 
 query_responses: dict[int | str, dict[str, Any]] = {
@@ -100,7 +102,8 @@ def conversation_request(
     summarizer_response = generate_response(
         processed_request.conversation_id,
         llm_request,
-        processed_request.previous_input,
+        processed_request.user_id,
+        processed_request.skip_user_id_check,
         streaming=True,
         user_token=processed_request.user_token,
         client_headers=client_headers,
@@ -123,7 +126,7 @@ def conversation_request(
     )
 
 
-def format_stream_data(d: dict) -> str:
+def format_stream_data(d: dict[str, object]) -> str:
     """Format outbound data in the Event Stream Format."""
     data = json.dumps(d)
     return f"data: {data}\n\n"
@@ -145,7 +148,9 @@ def stream_start_event(conversation_id: str) -> str:
     )
 
 
-def stream_event(data: dict, event_type: str, media_type: str) -> str:
+def stream_event(  # pylint: disable=R0911
+    data: dict[str, object], event_type: str, media_type: str
+) -> str:
     """Build an item to yield based on media type.
 
     Args:
@@ -157,20 +162,28 @@ def stream_event(data: dict, event_type: str, media_type: str) -> str:
         str: The formatted string or JSON to yield.
     """
     if media_type == MEDIA_TYPE_TEXT:
-        if event_type == LLM_TOKEN_EVENT:
-            return data["token"]
-        if event_type == LLM_TOOL_CALL_EVENT:
-            return f"\nTool call: {json.dumps(data)}\n"
-        if event_type == LLM_TOOL_RESULT_EVENT:
-            return f"\nTool result: {json.dumps(data)}\n"
-        logger.error("Unknown event type: %s", event_type)
-        return ""
-    return format_stream_data(
-        {
-            "event": event_type,
-            "data": data,
-        }
-    )
+        text_output = ""
+        match event_type:
+            case "token":
+                text_output = str(data["token"])
+            case "reasoning":
+                text_output = str(data["reasoning"])
+            case "tool_call":
+                text_output = f"\nTool call: {json.dumps(data)}\n"
+            case "approval_required":
+                text_output = f"\nApproval request: {json.dumps(data)}\n"
+            case "tool_result":
+                text_output = f"\nTool result: {json.dumps(data)}\n"
+            case "skill_selected":
+                text_output = f"\nSkill selected: {data.get('name', 'unknown')}\n"
+            case "history_compression_start":
+                text_output = f"\nHistory compression start: {json.dumps(data)}\n"
+            case "history_compression_end":
+                text_output = f"\nHistory compression end: {json.dumps(data)}\n"
+            case _:
+                logger.error("Unknown event type: %s", event_type)
+        return text_output
+    return format_stream_data({"event": event_type, "data": data})
 
 
 def stream_end_event(
@@ -196,8 +209,9 @@ def stream_end_event(
                 "data": {
                     "referenced_documents": ref_docs,
                     "truncated": truncated,
-                    "input_tokens": calc_input_tokens(token_counter),
-                    "output_tokens": calc_output_tokens(token_counter),
+                    "input_tokens": calc_tokens(token_counter, "input_tokens"),
+                    "output_tokens": calc_tokens(token_counter, "output_tokens"),
+                    "reasoning_tokens": calc_tokens(token_counter, "reasoning_tokens"),
                 },
                 "available_quotas": available_quotas,
             }
@@ -288,8 +302,8 @@ def store_data(
     conversation_id: str,
     llm_request: LLMRequest,
     response: str,
-    tool_calls: list[dict],
-    tool_results: list[ToolMessage],
+    tool_calls: list[dict[str, object]],
+    tool_results: list[dict[str, object]],
     attachments: list[Attachment],
     query_without_attachments: str,
     rag_chunks: list[RagChunk],
@@ -341,8 +355,8 @@ def store_data(
     timestamps["store transcripts"] = time.time()
 
 
-async def response_processing_wrapper(
-    generator: AsyncGenerator[Any, None],
+async def response_processing_wrapper(  # noqa: C901  # pylint: disable=R0912,R0915
+    generator: AsyncGenerator[StreamedChunk, None],
     user_id: str,
     conversation_id: str,
     llm_request: LLMRequest,
@@ -372,11 +386,12 @@ async def response_processing_wrapper(
         yield stream_start_event(conversation_id)
 
     response: str = ""
-    rag_chunks: list = []
-    tool_calls: list = []
-    tool_results: list = []
+    rag_chunks: list[RagChunk] = []
+    tool_calls: list[dict[str, object]] = []
+    tool_results: list[dict[str, object]] = []
     history_truncated: bool = False
     idx: int = 0
+    was_reasoning: bool = False
     token_counter: Optional[TokenCounter] = None
 
     try:
@@ -385,39 +400,75 @@ async def response_processing_wrapper(
                 msg = f"Expecting StreamedChunk, but got {type(item)}: {item}"
                 logger.error(msg)
                 raise ValueError(msg)
-            if item.type == "tool_call":
-                tool_calls.append(item.data)
-                yield stream_event(
-                    data=item.data,
-                    event_type=LLM_TOOL_CALL_EVENT,
-                    media_type=media_type,
-                )
-            elif item.type == "tool_result":
-                tool_results.append(item.data)
-                yield stream_event(
-                    data=item.data,
-                    event_type=LLM_TOOL_RESULT_EVENT,
-                    media_type=media_type,
-                )
-            elif item.type == "text":
-                response += item.text
-                yield stream_event(
-                    data={"id": idx, "token": item.text},
-                    event_type=LLM_TOKEN_EVENT,
-                    media_type=media_type,
-                )
-                idx += 1
-            elif item.type == "end":
-                rag_chunks = item.data["rag_chunks"]
-                history_truncated = item.data["truncated"]
-                token_counter = item.data["token_counter"]
-            else:
-                msg = (
-                    "Yielded unknown item type from streaming generator, "
-                    f"item: {item}"
-                )
-                logger.error(msg)
-                raise ValueError(msg)
+            match item.type:
+                case StreamChunkType.TOOL_CALL:
+                    tool_calls.append(item.data)
+                    yield stream_event(
+                        data=item.data,
+                        event_type=LLM_TOOL_CALL_EVENT,
+                        media_type=media_type,
+                    )
+                case StreamChunkType.APPROVAL_REQUIRED:
+                    yield stream_event(
+                        data=item.data,
+                        event_type=StreamChunkType.APPROVAL_REQUIRED.value,
+                        media_type=media_type,
+                    )
+                case StreamChunkType.TOOL_RESULT:
+                    tool_results.append(item.data)
+                    yield stream_event(
+                        data=item.data,
+                        event_type=LLM_TOOL_RESULT_EVENT,
+                        media_type=media_type,
+                    )
+                case StreamChunkType.SKILL_SELECTED:
+                    yield stream_event(
+                        data=item.data,
+                        event_type=StreamChunkType.SKILL_SELECTED.value,
+                        media_type=media_type,
+                    )
+                case StreamChunkType.HISTORY_COMPRESSION_START:
+                    yield stream_event(
+                        data=item.data,
+                        event_type=LLM_HISTORY_COMPRESSION_START_EVENT,
+                        media_type=media_type,
+                    )
+                case StreamChunkType.HISTORY_COMPRESSION_END:
+                    yield stream_event(
+                        data=item.data,
+                        event_type=LLM_HISTORY_COMPRESSION_END_EVENT,
+                        media_type=media_type,
+                    )
+                case StreamChunkType.REASONING:
+                    was_reasoning = True
+                    yield stream_event(
+                        data={"id": idx, "reasoning": item.text},
+                        event_type=LLM_REASONING_EVENT,
+                        media_type=media_type,
+                    )
+                    idx += 1
+                case StreamChunkType.TEXT:
+                    if was_reasoning and media_type == MEDIA_TYPE_TEXT:
+                        yield "\n\n"
+                        was_reasoning = False
+                    response += item.text
+                    yield stream_event(
+                        data={"id": idx, "token": item.text},
+                        event_type=LLM_TOKEN_EVENT,
+                        media_type=media_type,
+                    )
+                    idx += 1
+                case StreamChunkType.END:
+                    rag_chunks = item.data["rag_chunks"]
+                    history_truncated = item.data["truncated"]
+                    token_counter = item.data["token_counter"]
+                case _:
+                    msg = (
+                        "Yielded unknown item type from streaming generator, "
+                        f"item: {item}"
+                    )
+                    logger.error(msg)
+                    raise ValueError(msg)
     except PromptTooLongError as summarizer_error:
         yield prompt_too_long_error(summarizer_error, media_type)
         return  # stop execution after error
@@ -457,8 +508,8 @@ async def response_processing_wrapper(
         skip_user_id_check,
     )
 
-    input_tokens = calc_input_tokens(token_counter)
-    output_tokens = calc_output_tokens(token_counter)
+    input_tokens = calc_tokens(token_counter, "input_tokens")
+    output_tokens = calc_tokens(token_counter, "output_tokens")
 
     consume_tokens(
         config.quota_limiters,

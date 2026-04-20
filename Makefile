@@ -66,7 +66,7 @@ benchmarks: ## Run benchmarks
 test-unit: ## Run the unit tests
 	@echo "Running unit tests..."
 	@echo "Reports will be written to ${ARTIFACT_DIR}"
-	COVERAGE_FILE="${ARTIFACT_DIR}/.coverage.unit" uv run pytest tests/unit tests/mcp_local --cov=ols --cov=mcp_local --cov=runner --cov-report term-missing --cov-report "json:${ARTIFACT_DIR}/coverage_unit.json" --junit-xml="${ARTIFACT_DIR}/junit_unit.xml"
+	COVERAGE_FILE="${ARTIFACT_DIR}/.coverage.unit" uv run pytest tests/unit --cov=ols --cov=runner --cov-report term-missing --cov-report "json:${ARTIFACT_DIR}/coverage_unit.json" --junit-xml="${ARTIFACT_DIR}/junit_unit.xml"
 	uv run scripts/transform_coverage_report.py "${ARTIFACT_DIR}/coverage_unit.json" "${ARTIFACT_DIR}/coverage_unit.out"
 	scripts/codecov.sh "${ARTIFACT_DIR}/coverage_unit.out"
 
@@ -86,7 +86,7 @@ test-e2e: ## Run e2e tests - requires running OLS server
 	@echo "Running e2e tests..."
 	@echo "Reports will be written to ${ARTIFACT_DIR}"
 	uv run pytest tests/e2e --ignore=tests/e2e/evaluation -s --durations=0 -o junit_suite_name="${SUITE_ID}" -m "${TEST_TAGS}" --junit-prefix="${SUITE_ID}" --junit-xml="${ARTIFACT_DIR}/junit_e2e_${SUITE_ID}.xml" \
-	--eval_provider ${PROVIDER} --eval_model ${MODEL} --eval_out_dir ${ARTIFACT_DIR} --rp_name=ols-e2e-tests
+	--eval_provider ${PROVIDER} --eval_model ${MODEL} --eval_out_dir ${ARTIFACT_DIR}
 
 test-eval: ## Run evaluation tests - requires running OLS server
 	@echo "Running evaluation tests..."
@@ -94,10 +94,10 @@ test-eval: ## Run evaluation tests - requires running OLS server
 	uv run --extra evaluation pytest tests/e2e/evaluation -vv -s --durations=0 -o junit_suite_name="${SUITE_ID}" --junit-prefix="${SUITE_ID}" --junit-xml="${ARTIFACT_DIR}/junit_e2e_${SUITE_ID}.xml" \
 	--eval_out_dir ${ARTIFACT_DIR} -m "not lseval"
 
-test-lseval-periodic: ## Run LSEval periodic evaluation - requires running OLS server with WatsonX and Azure OpenAI judge keys
+test-lseval-periodic: ## Run LSEval periodic evaluation (full 797-question dataset) - requires running OLS server with OpenAI keys
 	@echo "Running LSEval periodic evaluation..."
 	@echo "Reports will be written to ${ARTIFACT_DIR}"
-	uv run --extra lseval pytest tests/e2e/evaluation -vv -s --durations=0 -o junit_suite_name="${SUITE_ID}" --junit-prefix="${SUITE_ID}" --junit-xml="${ARTIFACT_DIR}/junit_e2e_${SUITE_ID}.xml" \
+	uv run --extra lseval --extra evaluation pytest tests/e2e/evaluation -vv -s --durations=0 -o junit_suite_name="${SUITE_ID}" --junit-prefix="${SUITE_ID}" --junit-xml="${ARTIFACT_DIR}/junit_e2e_${SUITE_ID}.xml" \
 	--eval_out_dir ${ARTIFACT_DIR} -m lseval
 
 coverage-report:	unit-tests-coverage-report integration-tests-coverage-report ## Export coverage reports into interactive HTML
@@ -166,6 +166,12 @@ shellcheck: ## Run shellcheck
 	wget -qO- "https://github.com/koalaman/shellcheck/releases/download/stable/shellcheck-stable.linux.x86_64.tar.xz" | tar -xJv \
 	shellcheck --version
 	shellcheck -- */*.sh
+
+konflux-requirements:	## Generate hermetic requirements.*.txt file for konflux build
+	./scripts/konflux_requirements.sh
+
+konflux-rpm-lock:	## Generate rpm.lock.yaml file for konflux build
+	./scripts/generate-rpm-lock.sh -a ${ACTIVATION_KEY} -g ${ORG_ID}
 
 help: ## Show this help screen
 	@echo 'Usage: make <OPTIONS> ... <TARGETS>'

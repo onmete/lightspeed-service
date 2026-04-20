@@ -3,7 +3,7 @@
     "info": {
         "title": "Swagger OpenShift LightSpeed service - OpenAPI",
         "description": "OpenShift LightSpeed service API specification.",
-        "version": "1.0.10"
+        "version": "1.0.12"
     },
     "paths": {
         "/v1/query": {
@@ -372,6 +372,86 @@
                     },
                     "500": {
                         "description": "Internal server error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ErrorResponse"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/v1/tool-approvals/decision": {
+            "post": {
+                "tags": [
+                    "tool-approvals"
+                ],
+                "summary": "Submit Tool Approval Decision",
+                "description": "Submit user decision for a pending tool approval request.",
+                "operationId": "submit_tool_approval_decision_v1_tool_approvals_decision_post",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/ToolApprovalDecisionRequest"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "responses": {
+                    "200": {
+                        "description": "Approval decision applied successfully",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Missing or invalid credentials provided by client",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/UnauthorizedResponse"
+                                }
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Client does not have permission to access resource",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ForbiddenResponse"
+                                }
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Approval request not found",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ErrorResponse"
+                                }
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Approval request already resolved",
                         "content": {
                             "application/json": {
                                 "schema": {
@@ -1272,7 +1352,7 @@
                 "examples": [
                     {
                         "detail": {
-                            "cause": "Failed to handle request to https://bam-api.res.ibm.com/v2/text",
+                            "cause": "Failed to handle request to https://api.openai.com/v1/chat/completions",
                             "response": "Error while validation question"
                         }
                     },
@@ -1482,6 +1562,10 @@
                             }
                         ],
                         "title": "Mcp Headers"
+                    },
+                    "mode": {
+                        "$ref": "#/components/schemas/QueryMode",
+                        "default": "ask"
                     }
                 },
                 "additionalProperties": false,
@@ -1490,7 +1574,7 @@
                     "query"
                 ],
                 "title": "LLMRequest",
-                "description": "Model representing a request for the LLM (Language Model) send into OLS service.\n\nAttributes:\n    query: The query string.\n    conversation_id: The optional conversation ID (UUID).\n    provider: The optional provider.\n    model: The optional model.\n    attachments: The optional attachments.\n    media_type: The optional parameter for streaming response.\n    mcp_headers: Optional JSON object mapping MCP server names to header lists.\n\nExample:\n    ```python\n    llm_request = LLMRequest(query=\"Tell me about Kubernetes\")\n    ```",
+                "description": "Model representing a request for the LLM (Language Model) send into OLS service.\n\nAttributes:\n    query: The query string.\n    conversation_id: The optional conversation ID (UUID).\n    provider: The optional provider.\n    model: The optional model.\n    attachments: The optional attachments.\n    media_type: The optional parameter for streaming response.\n    mcp_headers: Optional JSON object mapping MCP server names to header lists.\n    mode: The query mode controlling which system prompt is used.\n\nExample:\n    ```python\n    llm_request = LLMRequest(query=\"Tell me about Kubernetes\")\n    ```",
                 "examples": [
                     {
                         "attachments": [
@@ -1513,6 +1597,7 @@
                         "conversation_id": "123e4567-e89b-12d3-a456-426614174000",
                         "mcp_headers": "{\"github-mcp\": {\"Authorization\": \"Bearer ghp_xxxxx\"}}",
                         "media_type": "text/plain",
+                        "mode": "ask",
                         "model": "model-name",
                         "provider": "openai",
                         "query": "write a deployment yaml for the mongodb image",
@@ -1910,6 +1995,15 @@
                     }
                 ]
             },
+            "QueryMode": {
+                "type": "string",
+                "enum": [
+                    "ask",
+                    "troubleshooting"
+                ],
+                "title": "QueryMode",
+                "description": "Query modes that control which system prompt is used."
+            },
             "ReadinessResponse": {
                 "properties": {
                     "ready": {
@@ -1979,6 +2073,32 @@
                         "status": {
                             "enabled": true
                         }
+                    }
+                ]
+            },
+            "ToolApprovalDecisionRequest": {
+                "properties": {
+                    "approval_id": {
+                        "type": "string",
+                        "title": "Approval Id"
+                    },
+                    "approved": {
+                        "type": "boolean",
+                        "title": "Approved"
+                    }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                    "approval_id",
+                    "approved"
+                ],
+                "title": "ToolApprovalDecisionRequest",
+                "description": "Request payload to submit a tool-approval decision.\n\nAttributes:\n    approval_id: Unique identifier of a pending approval request.\n    approved: True to approve tool execution, False to reject it.",
+                "examples": [
+                    {
+                        "approval_id": "a89a5d3f-4bda-4eab-9f90-61d8e7b06dd2",
+                        "approved": true
                     }
                 ]
             },

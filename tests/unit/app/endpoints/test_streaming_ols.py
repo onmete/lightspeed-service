@@ -10,6 +10,9 @@ from ols import config, constants
 config.ols_config.authentication_config.module = "k8s"
 
 from ols.app.endpoints.streaming_ols import (  # noqa:E402
+    LLM_HISTORY_COMPRESSION_END_EVENT,
+    LLM_HISTORY_COMPRESSION_START_EVENT,
+    LLM_REASONING_EVENT,
     LLM_TOKEN_EVENT,
     LLM_TOOL_CALL_EVENT,
     LLM_TOOL_RESULT_EVENT,
@@ -21,7 +24,7 @@ from ols.app.endpoints.streaming_ols import (  # noqa:E402
     stream_event,
     stream_start_event,
 )
-from ols.app.models.models import RagChunk, TokenCounter  # noqa:E402
+from ols.app.models.models import RagChunk, StreamChunkType, TokenCounter  # noqa:E402
 from ols.utils import suid  # noqa:E402
 from ols.utils.errors_parsing import DEFAULT_ERROR_MESSAGE  # noqa:E402
 
@@ -42,8 +45,13 @@ def _load_config():
 def test_event_type_are_not_changed():
     """Test that event types are not changed."""
     assert LLM_TOKEN_EVENT == "token"  # noqa: S105
+    assert LLM_REASONING_EVENT == "reasoning"
     assert LLM_TOOL_CALL_EVENT == "tool_call"
     assert LLM_TOOL_RESULT_EVENT == "tool_result"
+    assert StreamChunkType.SKILL_SELECTED.value == "skill_selected"
+    assert LLM_HISTORY_COMPRESSION_START_EVENT == "history_compression_start"
+    assert LLM_HISTORY_COMPRESSION_END_EVENT == "history_compression_end"
+    assert StreamChunkType.APPROVAL_REQUIRED.value == "approval_required"
 
 
 def test_format_stream_data():
@@ -65,8 +73,41 @@ def test_stream_event():
         == '\nTool call: {"token": "hi", "idx": 1}\n'
     )
     assert (
+        stream_event(
+            data, StreamChunkType.APPROVAL_REQUIRED.value, constants.MEDIA_TYPE_TEXT
+        )
+        == '\nApproval request: {"token": "hi", "idx": 1}\n'
+    )
+    assert (
         stream_event(data, LLM_TOOL_RESULT_EVENT, constants.MEDIA_TYPE_TEXT)
         == '\nTool result: {"token": "hi", "idx": 1}\n'
+    )
+    assert (
+        stream_event(
+            data, LLM_HISTORY_COMPRESSION_START_EVENT, constants.MEDIA_TYPE_TEXT
+        )
+        == '\nHistory compression start: {"token": "hi", "idx": 1}\n'
+    )
+    assert (
+        stream_event(data, LLM_HISTORY_COMPRESSION_END_EVENT, constants.MEDIA_TYPE_TEXT)
+        == '\nHistory compression end: {"token": "hi", "idx": 1}\n'
+    )
+
+    # skill_selected - text shows name, json wraps as SSE
+    skill_data = {"name": "pod-diagnostics", "confidence": 0.85}
+    assert "pod-diagnostics" in stream_event(
+        skill_data, StreamChunkType.SKILL_SELECTED.value, constants.MEDIA_TYPE_TEXT
+    )
+    assert stream_event(
+        skill_data, StreamChunkType.SKILL_SELECTED.value, constants.MEDIA_TYPE_JSON
+    ) == (
+        'data: {"event": "skill_selected", '
+        '"data": {"name": "pod-diagnostics", "confidence": 0.85}}\n\n'
+    )
+
+    # skill_selected with missing name falls back to 'unknown'
+    assert "unknown" in stream_event(
+        {}, StreamChunkType.SKILL_SELECTED.value, constants.MEDIA_TYPE_TEXT
     )
 
     # json output
@@ -79,8 +120,24 @@ def test_stream_event():
         == 'data: {"event": "tool_call", "data": {"token": "hi", "idx": 1}}\n\n'
     )
     assert (
+        stream_event(
+            data, StreamChunkType.APPROVAL_REQUIRED.value, constants.MEDIA_TYPE_JSON
+        )
+        == 'data: {"event": "approval_required", "data": {"token": "hi", "idx": 1}}\n\n'
+    )
+    assert (
         stream_event(data, LLM_TOOL_RESULT_EVENT, constants.MEDIA_TYPE_JSON)
         == 'data: {"event": "tool_result", "data": {"token": "hi", "idx": 1}}\n\n'
+    )
+    assert (
+        stream_event(
+            data, LLM_HISTORY_COMPRESSION_START_EVENT, constants.MEDIA_TYPE_JSON
+        )
+        == 'data: {"event": "history_compression_start", "data": {"token": "hi", "idx": 1}}\n\n'
+    )
+    assert (
+        stream_event(data, LLM_HISTORY_COMPRESSION_END_EVENT, constants.MEDIA_TYPE_JSON)
+        == 'data: {"event": "history_compression_end", "data": {"token": "hi", "idx": 1}}\n\n'
     )
 
 
@@ -170,12 +227,15 @@ def test_stream_end_event():
                 "truncated": truncated,
                 "input_tokens": 0,
                 "output_tokens": 0,
+                "reasoning_tokens": 0,
             },
             "available_quotas": {},
         }
     )
 
-    token_counter = TokenCounter(input_tokens=123, output_tokens=456)
+    token_counter = TokenCounter(
+        input_tokens=123, output_tokens=456, reasoning_tokens=78
+    )
     assert stream_end_event(
         ref_docs,
         truncated,
@@ -192,6 +252,7 @@ def test_stream_end_event():
                 "truncated": truncated,
                 "input_tokens": 123,
                 "output_tokens": 456,
+                "reasoning_tokens": 78,
             },
             "available_quotas": {"limiter1": 10, "limiter2": 20},
         }
@@ -210,3 +271,38 @@ def test_build_referenced_docs():
         {"doc_title": "title_1", "doc_url": "url_1"},
         {"doc_title": "title_2", "doc_url": "url_2"},
     ]
+
+
+def test_stream_event_reasoning_text():
+    """Test stream_event returns reasoning content for text media type."""
+    data = {"reasoning": "thinking step"}
+    assert (
+        stream_event(data, LLM_REASONING_EVENT, constants.MEDIA_TYPE_TEXT)
+        == "thinking step"
+    )
+
+
+def test_stream_event_reasoning_json():
+    """Test stream_event wraps reasoning in event envelope for JSON media type."""
+    data = {"reasoning": "thinking step"}
+    assert stream_event(
+        data, LLM_REASONING_EVENT, constants.MEDIA_TYPE_JSON
+    ) == format_stream_data(
+        {
+            "event": "reasoning",
+            "data": {"reasoning": "thinking step"},
+        }
+    )
+
+
+def test_stream_end_event_with_reasoning_tokens():
+    """Test stream_end_event includes reasoning_tokens in JSON output."""
+    ref_docs = [{"doc_title": "t", "doc_url": "u"}]
+    token_counter = TokenCounter(input_tokens=10, output_tokens=20, reasoning_tokens=30)
+    result = stream_end_event(
+        ref_docs, False, constants.MEDIA_TYPE_JSON, token_counter, {}
+    )
+    parsed = json.loads(result.removeprefix("data: ").strip())
+    assert parsed["data"]["reasoning_tokens"] == 30
+    assert parsed["data"]["input_tokens"] == 10
+    assert parsed["data"]["output_tokens"] == 20

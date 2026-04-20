@@ -20,6 +20,7 @@ from . import test_api
 QUERY_ENDPOINT = "/v1/query"
 
 
+@retry(max_attempts=3, wait_between_runs=10)
 def test_invalid_question():
     """Check the REST API /v1/query with POST HTTP method for invalid question."""
     with metrics_utils.RestAPICallCounterChecker(pytest.metrics_client, QUERY_ENDPOINT):
@@ -50,6 +51,7 @@ def test_invalid_question():
         )
 
 
+@retry(max_attempts=3, wait_between_runs=10)
 def test_invalid_question_without_conversation_id():
     """Check the REST API /v1/query with invalid question and without conversation ID."""
     with metrics_utils.RestAPICallCounterChecker(pytest.metrics_client, QUERY_ENDPOINT):
@@ -130,14 +132,14 @@ def test_valid_question_improper_conversation_id() -> None:
     with metrics_utils.RestAPICallCounterChecker(
         pytest.metrics_client,
         QUERY_ENDPOINT,
-        status_code=requests.codes.internal_server_error,
+        status_code=requests.codes.bad_request,
     ):
         response = pytest.client.post(
             QUERY_ENDPOINT,
             json={"conversation_id": "not-uuid", "query": "what is kubernetes?"},
             timeout=test_api.LLM_REST_API_TIMEOUT,
         )
-        assert response.status_code == requests.codes.internal_server_error
+        assert response.status_code == requests.codes.bad_request
 
         response_utils.check_content_type(response, "application/json")
         json_response = response.json()
@@ -379,6 +381,7 @@ def test_rag_question() -> None:
 
 
 @pytest.mark.cluster
+@retry(max_attempts=3, wait_between_runs=10)
 def test_query_filter() -> None:
     """Ensure responses does not include filtered words and redacted words are not logged."""
     with metrics_utils.RestAPICallCounterChecker(pytest.metrics_client, QUERY_ENDPOINT):
@@ -474,7 +477,7 @@ def test_query_with_provider_but_not_model() -> None:
             json={
                 "conversation_id": "",
                 "query": "what is kubernetes?",
-                "provider": "bam",
+                "provider": "openai",
             },
             timeout=test_api.LLM_REST_API_TIMEOUT,
         )

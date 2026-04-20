@@ -8,6 +8,11 @@ llm_providers:
     models:
       - name: model-name-1
       - name: model-name-2
+        # Reasoning model settings (GPT-5, o-series). Omit for non-reasoning models.
+        # parameters:
+        #   reasoning_effort: low      # low | medium | high (default: low)
+        #   reasoning_summary: concise  # auto | concise | detailed (default: concise)
+        #   verbosity: low             # low | medium | high (default: low)
   - name: my_azure_openai
     type: azure_openai
     url: "https://myendpoint.openai.azure.com/"
@@ -35,6 +40,16 @@ llm_providers:
     credentials_path: rhelai_api_key.txt
     models:
       - name: model-name
+  - name: my_google_vertex
+    type: google_vertex_anthropic
+    url: "https://us-east5-aiplatform.googleapis.com"
+    credentials_path: gcp_credentials.txt
+    project_id: my-gcp-project
+    google_vertex_anthropic_config:
+      project: my-gcp-project
+      location: us-east5
+    models:
+      - name: claude-opus-4-6
   - name: instructlab
     type: openai
     url: "http://localhost:8000/v1"

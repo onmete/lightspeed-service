@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from langchain_core.messages import AIMessage, HumanMessage
 
 from ols import config, constants
+from ols.constants import QueryMode
 
 # needs to be setup there before is_user_authorized is imported
 config.ols_config.authentication_config.module = "k8s"
@@ -60,60 +61,6 @@ def test_retrieve_conversation_id_existing_id():
 
 
 @pytest.mark.usefixtures("_load_config")
-def test_retrieve_previous_input_no_previous_history():
-    """Check how function to retrieve previous input handle empty history."""
-    llm_request = LLMRequest(query="Tell me about Kubernetes", conversation_id="")
-    assert llm_request.conversation_id is not None
-    llm_input = ols.retrieve_previous_input(
-        constants.DEFAULT_USER_UID, llm_request.conversation_id
-    )
-    assert llm_input == []
-
-
-@pytest.mark.usefixtures("_load_config")
-def test_retrieve_previous_input_empty_user_id():
-    """Check how function to retrieve previous input handle empty user ID."""
-    conversation_id = suid.get_suid()
-    llm_request = LLMRequest(
-        query="Tell me about Kubernetes", conversation_id=conversation_id
-    )
-    assert llm_request.conversation_id is not None
-    # cache must check if user ID is correct
-    with pytest.raises(HTTPException, match="Invalid user ID"):
-        ols.retrieve_previous_input("", llm_request.conversation_id)
-    with pytest.raises(HTTPException, match="Invalid user ID"):
-        ols.retrieve_previous_input(None, llm_request.conversation_id)
-
-
-@pytest.mark.usefixtures("_load_config")
-def test_retrieve_previous_input_improper_user_id():
-    """Check how function to retrieve previous input handle improper user ID."""
-    conversation_id = suid.get_suid()
-    llm_request = LLMRequest(
-        query="Tell me about Kubernetes", conversation_id=conversation_id
-    )
-    assert llm_request.conversation_id is not None
-    # cache must check if user ID is correct
-    with pytest.raises(HTTPException, match="Invalid user ID improper_user_id"):
-        ols.retrieve_previous_input("improper_user_id", llm_request.conversation_id)
-
-
-@pytest.mark.usefixtures("_load_config")
-def test_retrieve_previous_input_for_previous_history():
-    """Check how function to retrieve previous input handle existing history."""
-    conversation_id = suid.get_suid()
-    with patch("ols.config.conversation_cache.get") as get:
-        get.return_value = "input"
-        llm_request = LLMRequest(
-            query="Tell me about Kubernetes", conversation_id=conversation_id
-        )
-        assert llm_request.conversation_id is not None
-        previous_input = ols.retrieve_previous_input(
-            constants.DEFAULT_USER_UID, llm_request.conversation_id
-        )
-        assert previous_input == "input"
-
-
 @pytest.mark.usefixtures("_load_config")
 def test_retrieve_attachments_on_no_input():
     """Check the function to retrieve attachments from payload when attachments are not send."""
@@ -591,19 +538,19 @@ def test_attachments_redact_on_redact_error():
 def test_conversation_request(auth):
     """Test conversation request API endpoint."""
     with (
-        patch(
-            "ols.src.query_helpers.docs_summarizer.DocsSummarizer.create_response"
-        ) as mock_summarize,
+        patch("ols.app.endpoints.ols.DocsSummarizer") as mock_docs_summarizer,
         patch("ols.config.conversation_cache.get"),
     ):
         mock_response = (
             "Kubernetes is an open-source container-orchestration system..."  # summary
         )
-        mock_summarize.return_value = SummarizerResponse(
-            response=mock_response,
-            rag_chunks=[],
-            history_truncated=False,
-            token_counter=None,
+        mock_docs_summarizer.return_value.create_response.return_value = (
+            SummarizerResponse(
+                response=mock_response,
+                rag_chunks=[],
+                history_truncated=False,
+                token_counter=None,
+            )
         )
         llm_request = LLMRequest(query="Tell me about Kubernetes")
         response = ols.conversation_request(llm_request, auth)
@@ -620,9 +567,7 @@ def test_conversation_request(auth):
 def test_conversation_request_dedup_ref_docs(auth):
     """Test deduplication of referenced docs."""
     with (
-        patch(
-            "ols.src.query_helpers.docs_summarizer.DocsSummarizer.create_response"
-        ) as mock_summarize,
+        patch("ols.app.endpoints.ols.DocsSummarizer") as mock_docs_summarizer,
         patch("ols.config.conversation_cache.get"),
     ):
         mock_rag_chunk = [
@@ -632,11 +577,13 @@ def test_conversation_request_dedup_ref_docs(auth):
             ),  # duplicate doc
             RagChunk(text="text3", doc_url="url-a", doc_title="title-a"),
         ]
-        mock_summarize.return_value = SummarizerResponse(
-            response="some response",
-            rag_chunks=mock_rag_chunk,
-            history_truncated=False,
-            token_counter=None,
+        mock_docs_summarizer.return_value.create_response.return_value = (
+            SummarizerResponse(
+                response="some response",
+                rag_chunks=mock_rag_chunk,
+                history_truncated=False,
+                token_counter=None,
+            )
         )
         llm_request = LLMRequest(query="some query")
         response = ols.conversation_request(llm_request, auth)
@@ -655,14 +602,14 @@ def test_generate_response_valid_subject():
     mock_response = (
         "Kubernetes is an open-source container-orchestration system..."  # summary
     )
-    with patch(
-        "ols.src.query_helpers.docs_summarizer.DocsSummarizer.create_response"
-    ) as mock_summarize:
-        mock_summarize.return_value = SummarizerResponse(
-            mock_response,
-            [],
-            False,
-            token_counter=None,
+    with patch("ols.app.endpoints.ols.DocsSummarizer") as mock_docs_summarizer:
+        mock_docs_summarizer.return_value.create_response.return_value = (
+            SummarizerResponse(
+                mock_response,
+                [],
+                False,
+                token_counter=None,
+            )
         )
 
         # prepare arguments for DocsSummarizer
@@ -679,6 +626,34 @@ def test_generate_response_valid_subject():
         assert "Kubernetes" in summarizer_response.response
         assert summarizer_response.rag_chunks == []
         assert summarizer_response.history_truncated is False
+
+
+@pytest.mark.usefixtures("_load_config")
+def test_generate_response_passes_mode_to_summarizer():
+    """Test that generate_response passes mode from LLMRequest to DocsSummarizer."""
+    mock_response = "some response"
+    with (
+        patch(
+            "ols.src.query_helpers.docs_summarizer.DocsSummarizer.__init__",
+            return_value=None,
+        ) as mock_init,
+        patch(
+            "ols.src.query_helpers.docs_summarizer.DocsSummarizer.create_response",
+            return_value=SummarizerResponse(
+                mock_response, [], False, token_counter=None
+            ),
+        ),
+    ):
+        conversation_id = suid.get_suid()
+        llm_request = LLMRequest(
+            query="My pod is crashlooping", mode=QueryMode.TROUBLESHOOTING
+        )
+        previous_input: list = []
+
+        ols.generate_response(conversation_id, llm_request, previous_input)
+
+        _, kwargs = mock_init.call_args
+        assert kwargs.get("mode") == QueryMode.TROUBLESHOOTING
 
 
 @pytest.mark.usefixtures("_load_config")
@@ -808,6 +783,7 @@ def test_store_transcript(transcripts_location):
             "model": None,
             "user_id": user_id,
             "conversation_id": conversation_id,
+            "mode": "ask",
             "timestamp": "fake-timestamp",
         },
         "redacted_query": query,
@@ -838,32 +814,21 @@ def test_store_transcript(transcripts_location):
     }
 
 
-def test_calc_input_tokens_no_token_counter():
-    """Test the helper function calc_input_tokens."""
-    token_counter = None
-    tokens = ols.calc_input_tokens(token_counter)
-    assert tokens == 0
+def test_calc_tokens_no_token_counter():
+    """Test calc_tokens returns 0 when token counter is None."""
+    assert ols.calc_tokens(None, "input_tokens") == 0
+    assert ols.calc_tokens(None, "output_tokens") == 0
+    assert ols.calc_tokens(None, "reasoning_tokens") == 0
 
 
-def test_calc_input_tokens_for_token_counter():
-    """Test the helper function calc_input_tokens."""
-    token_counter = TokenCounter(input_tokens=100)
-    tokens = ols.calc_input_tokens(token_counter)
-    assert tokens == 100
-
-
-def test_calc_output_tokens_no_token_counter():
-    """Test the helper function calc_output_tokens."""
-    token_counter = None
-    tokens = ols.calc_output_tokens(token_counter)
-    assert tokens == 0
-
-
-def test_calc_output_tokens_for_token_counter():
-    """Test the helper function calc_output_tokens."""
-    token_counter = TokenCounter(output_tokens=100)
-    tokens = ols.calc_output_tokens(token_counter)
-    assert tokens == 100
+def test_calc_tokens_for_token_counter():
+    """Test calc_tokens extracts the correct attribute from a token counter."""
+    token_counter = TokenCounter(
+        input_tokens=100, output_tokens=200, reasoning_tokens=50
+    )
+    assert ols.calc_tokens(token_counter, "input_tokens") == 100
+    assert ols.calc_tokens(token_counter, "output_tokens") == 200
+    assert ols.calc_tokens(token_counter, "reasoning_tokens") == 50
 
 
 def test_consume_tokens_no_quota_limiters():
