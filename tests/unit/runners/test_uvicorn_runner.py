@@ -56,9 +56,10 @@ def _assert_start_uvicorn(
     )
     fake_server = SimpleNamespace(run=Mock())
 
-    with patch("ols.runners.uvicorn.uvicorn.Config") as mocked_config, patch(
-        "ols.runners.uvicorn.uvicorn.Server"
-    ) as mocked_server:
+    with (
+        patch("ols.runners.uvicorn.uvicorn.Config") as mocked_config,
+        patch("ols.runners.uvicorn.uvicorn.Server") as mocked_server,
+    ):
         mocked_config.return_value = fake_uvicorn_config
         mocked_server.return_value = fake_server
         start_uvicorn(config)
@@ -86,7 +87,7 @@ def test_start_uvicorn(default_config):
     """Test the function to start Uvicorn server."""
     _assert_start_uvicorn(
         default_config,
-        host="0.0.0.0",
+        host="0.0.0.0",  # noqa: S104
         port=8080,
         min_tls_version=None,
         ssl_ciphers=constants.DEFAULT_SSL_CIPHERS,
@@ -98,7 +99,7 @@ def test_start_uvicorn_with_tls(default_config):
     default_config.dev_config.disable_tls = False
     _assert_start_uvicorn(
         default_config,
-        host="0.0.0.0",
+        host="0.0.0.0",  # noqa: S104
         port=8443,
         min_tls_version=None,
         ssl_ciphers=constants.DEFAULT_SSL_CIPHERS,
@@ -122,7 +123,7 @@ def test_start_uvicorn_on_non_default_port(default_config):
     default_config.dev_config.uvicorn_port_number = 8081
     _assert_start_uvicorn(
         default_config,
-        host="0.0.0.0",
+        host="0.0.0.0",  # noqa: S104
         port=8081,
         min_tls_version=None,
         ssl_ciphers=constants.DEFAULT_SSL_CIPHERS,
@@ -136,7 +137,9 @@ def test_start_uvicorn_on_non_default_port(default_config):
         ("ModernType", stdlib_ssl.TLSVersion.TLSv1_3),
     ],
 )
-def test_start_uvicorn_applies_min_tls_version(default_config, profile_type, min_tls_version):
+def test_start_uvicorn_applies_min_tls_version(
+    default_config, profile_type, min_tls_version
+):
     """Test the function to start Uvicorn server with a TLS security profile."""
     default_config.dev_config.disable_tls = False
     default_config.ols_config.tls_security_profile = TLSSecurityProfile(
@@ -144,7 +147,7 @@ def test_start_uvicorn_applies_min_tls_version(default_config, profile_type, min
     )
     _assert_start_uvicorn(
         default_config,
-        host="0.0.0.0",
+        host="0.0.0.0",  # noqa: S104
         port=8443,
         min_tls_version=min_tls_version,
         ssl_ciphers=tls.ciphers_for_tls_profile(profile_type),

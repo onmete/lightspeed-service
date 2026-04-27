@@ -6,7 +6,8 @@ import pytest
 
 from ols import constants
 from ols.app.models.config import TLSSecurityProfile
-from ols.utils import ssl as ssl_utils, tls
+from ols.utils import ssl as ssl_utils
+from ols.utils import tls
 
 
 def test_get_ssl_version_returns_protocol_constant():
