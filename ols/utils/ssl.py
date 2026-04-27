@@ -1,4 +1,4 @@
-"""Utility function for retrieving SSL version and list of ciphers for TLS secutiry profile."""
+"""Utility function for retrieving SSL version and list of ciphers for TLS security profile."""
 
 import logging
 import ssl
