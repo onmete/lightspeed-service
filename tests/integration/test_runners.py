@@ -91,7 +91,7 @@ def test_start_uvicorn_full_setup():
         ssl_keyfile="tests/config/key",
         ssl_certfile="tests/config/empty_cert.crt",
         ssl_keyfile_password="* this is password *",  # noqa: S106
-        ssl_ciphers="TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",  # noqa: E501
+        ssl_ciphers="TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
         min_tls_version=ssl.TLSVersion.TLSv1_3,
         access_log=False,
     )
