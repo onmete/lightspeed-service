@@ -32,8 +32,8 @@ spec:
       approvalType: tool_annotations
       approvalTimeout: 5
     toolFilteringConfig:
-      alpha: 0.5
-      topK: 5
+      alpha: 0.8
+      topK: 10
       threshold: 0.01
   mcpServers:
     - name: mock-file-auth
