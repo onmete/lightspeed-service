@@ -2,6 +2,14 @@
 # OLS Provider: OpenAI GPT-4o-mini (older mini model, being evaluated)
 # Judge LLM: OpenAI GPT-4.1-mini (newer mini model, scoring responses)
 
+# Core Evaluation Configuration
+# Limits concurrent evaluations to avoid OpenAI API rate limiting.
+# Each thread issues one OLS call (which internally calls the provider LLM)
+# and one judge LLM call, so 5 threads produce at most 10 concurrent OpenAI
+# requests at any time.
+core:
+  max_threads: 5
+
 # Judge LLM Configuration
 # Uses OpenAI GPT-4.1-mini for evaluation scoring.
 # Requires OPENAI_API_KEY environment variable.

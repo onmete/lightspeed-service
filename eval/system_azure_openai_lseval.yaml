@@ -2,6 +2,13 @@
 # OLS Provider: Azure OpenAI gpt-4.1-mini (model being evaluated)
 # Judge LLM: OpenAI GPT-4.1-mini (scoring responses)
 
+# Core Evaluation Configuration
+# Limits concurrent evaluations to avoid OpenAI API rate limiting on the judge LLM.
+# Each thread issues one OLS call and one judge LLM call, so 5 threads produce
+# at most 10 concurrent external API requests at any time.
+core:
+  max_threads: 5
+
 # Judge LLM Configuration
 # Requires OPENAI_API_KEY environment variable.
 llm:
