@@ -8,6 +8,9 @@ The OLS configmap is NOT patched here -- MCP config lives in the OLSConfig CR
 
 from pathlib import Path
 
+import yaml
+
+from ols.constants import DEFAULT_CONFIGURATION_FILE
 from tests.e2e.utils import cluster as cluster_utils
 from tests.e2e.utils.retry import retry_until_timeout_or_success
 
@@ -93,6 +96,77 @@ def setup_mcp_on_cluster() -> None:
     _create_token_secret()
     _deploy_mock_server()
     print("MCP pre-setup complete (secret + mock server)")
+
+
+def log_effective_mcp_debug_info() -> None:
+    """Print MCP-related effective config from the cluster (best-effort).
+
+    Logs ``spec.ols.introspectionEnabled`` from the OLSConfig CR and each entry in
+    ``mcp_servers`` from the ``olsconfig`` ConfigMap (embedded ``olsconfig.yaml``).
+    Intended for CI logs when debugging wrong tool selection (e.g. ``pods_log`` on
+    ``openshift`` vs mock ``openshift_pod_logs``). Skips quietly when ``oc`` or
+    resources are unavailable (e.g. local pytest against localhost).
+    """
+    print("\n--- MCP e2e debug: cluster MCP configuration (best-effort) ---")
+    try:
+        out = cluster_utils.run_oc(
+            [
+                "get",
+                "olsconfig",
+                "cluster",
+                "-o",
+                "jsonpath={.spec.ols.introspectionEnabled}",
+            ]
+        ).stdout.strip()
+        print(f"OLSConfig spec.ols.introspectionEnabled: {out!r}")
+    except Exception as e:
+        print(f"Could not read OLSConfig introspectionEnabled: {e}")
+
+    try:
+        raw = cluster_utils.run_oc(
+            [
+                "get",
+                "cm",
+                "olsconfig",
+                "-n",
+                NAMESPACE,
+                "-o",
+                "yaml",
+            ]
+        ).stdout
+        cm = yaml.safe_load(raw)
+        data = cm.get("data") or {}
+        if DEFAULT_CONFIGURATION_FILE not in data:
+            print(
+                "ConfigMap olsconfig: missing embedded file "
+                f"{DEFAULT_CONFIGURATION_FILE!r}; data keys={list(data)}"
+            )
+            print("--- end MCP e2e debug ---\n")
+            return
+        cfg = yaml.safe_load(data[DEFAULT_CONFIGURATION_FILE])
+        servers = cfg.get("mcp_servers") or []
+        print(
+            f"ConfigMap olsconfig data[{DEFAULT_CONFIGURATION_FILE!r}]: "
+            f"{len(servers)} mcp_server(s)"
+        )
+        for i, s in enumerate(servers):
+            if not isinstance(s, dict):
+                print(f"  [{i}] (non-dict entry): {s!r}")
+                continue
+            name = s.get("name", "?")
+            url = s.get("url", "")
+            print(f"  [{i}] name={name!r} url={url!r}")
+        names = [s.get("name") for s in servers if isinstance(s, dict)]
+        if "openshift" in names:
+            print(
+                "WARNING: built-in server name 'openshift' is present in mcp_servers. "
+                "The model may call pods_log against the real cluster. For mock-only "
+                "MCP e2e, set spec.ols.introspectionEnabled: false on OLSConfig so the "
+                "operator does not inject the OpenShift MCP server."
+            )
+    except Exception as e:
+        print(f"Could not read ConfigMap olsconfig / mcp_servers: {e}")
+    print("--- end MCP e2e debug ---\n")
 
 
 def teardown_mcp_on_cluster() -> None:

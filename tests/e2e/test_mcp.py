@@ -10,14 +10,34 @@ Locally: start the mock server manually (python tests/e2e/mcp/server/server.py 3
 # pyright: reportAttributeAccessIssue=false
 
 import json
+import os
 import threading
 from typing import Optional
 
 import pytest
 
 from tests.e2e.utils.constants import LLM_REST_API_TIMEOUT
+from tests.e2e.utils.mcp_setup import log_effective_mcp_debug_info
 
 pytestmark = pytest.mark.mcp
+
+
+def _ols_base_url() -> str:
+    return str(getattr(pytest, "ols_url", os.getenv("OLS_URL", ""))).lower()
+
+
+def _running_against_remote_ols() -> bool:
+    u = _ols_base_url()
+    return bool(u) and "localhost" not in u and "127.0.0.1" not in u
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _log_cluster_mcp_effective_config() -> None:
+    """Log effective ``mcp_servers`` from the ``olsconfig`` ConfigMap (remote OLS only)."""
+    if not _running_against_remote_ols():
+        return
+    log_effective_mcp_debug_info()
+
 
 CLIENT_HEADERS = {"mock-client-auth": {"Authorization": "Bearer my-client-token-456"}}
 
