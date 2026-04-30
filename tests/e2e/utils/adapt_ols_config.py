@@ -248,7 +248,9 @@ def _reconcile_olsconfig_with_operator(provider_list: list[str]) -> None:
         "Waiting for operator to be ready",
     )
     try:
-        cluster_utils.run_oc(["delete", "olsconfig", "cluster", "--ignore-not-found"])
+        cluster_utils.run_oc(
+            ["delete", "olsconfig", "cluster", "--ignore-not-found", "--wait"]
+        )
         print(" Old OLSConfig CR removed")
     except Exception as e:
         print(f"Could not delete old OLSConfig: {e}")
