@@ -97,6 +97,33 @@ def get_cluster_version() -> tuple[str, str]:
         raise Exception("Error getting cluster version") from e
 
 
+def lightspeed_operator_manager_deployed(
+    namespace: str = "openshift-lightspeed",
+) -> bool:
+    """Return True if the operator controller Deployment exists.
+
+    Used to detect a pre-installed operator without OLM (e.g. Konflux direct /
+    ``make deploy``). Bundle installs also create this Deployment, but those are
+    usually detected via ``ClusterServiceVersion`` first.
+    """
+    name_line = run_oc(
+        [
+            "get",
+            "deployment",
+            "lightspeed-operator-controller-manager",
+            "-n",
+            namespace,
+            "--ignore-not-found",
+            "-o",
+            "name",
+        ]
+    ).stdout.strip()
+    return name_line in (
+        "deployment.apps/lightspeed-operator-controller-manager",
+        "deployment/lightspeed-operator-controller-manager",
+    )
+
+
 def create_user(name: str, ignore_existing_resource=False) -> None:
     """Create a service account user for testing."""
     try:
