@@ -98,7 +98,7 @@ test-lseval-periodic: ## Run LSEval periodic evaluation (full 797-question datas
 	@echo "Running LSEval periodic evaluation..."
 	@echo "Reports will be written to ${ARTIFACT_DIR}"
 	uv run --extra lseval --extra evaluation pytest tests/e2e/evaluation -vv -s --durations=0 -o junit_suite_name="${SUITE_ID}" --junit-prefix="${SUITE_ID}" --junit-xml="${ARTIFACT_DIR}/junit_e2e_${SUITE_ID}.xml" \
-	--eval_out_dir ${ARTIFACT_DIR} -m lseval
+	--eval_out_dir ${ARTIFACT_DIR} -m lseval --lseval_provider ${PROVIDER}
 
 coverage-report:	unit-tests-coverage-report integration-tests-coverage-report ## Export coverage reports into interactive HTML
 

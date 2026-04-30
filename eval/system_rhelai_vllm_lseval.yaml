@@ -6,6 +6,13 @@
 # Override it for your deployment via the LSEVAL_OLS_MODEL environment variable, e.g.:
 #   export LSEVAL_OLS_MODEL=ibm/granite-3.1-8b-instruct
 
+# Core Evaluation Configuration
+# Limits concurrent evaluations to avoid OpenAI API rate limiting on the judge LLM.
+# Each thread issues one OLS call and one judge LLM call, so 5 threads produce
+# at most 10 concurrent external API requests at any time.
+core:
+  max_threads: 5
+
 # Judge LLM Configuration
 # Requires OPENAI_API_KEY environment variable.
 llm:
