@@ -392,6 +392,7 @@ def install_ols() -> tuple[str, str, str]:  # pylint: disable=R0915, R0912  # no
                 "delete",
                 "olsconfig",
                 "cluster",
+                "--wait",
             ],
         )
     except subprocess.CalledProcessError:
