@@ -1,7 +1,8 @@
 """Integration tests for runners."""
 
 import ssl
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -16,47 +17,84 @@ QUOTA_LIMITERS_CONFIG_FILE = (
 )
 
 
+def _run_start_uvicorn_and_assert(
+    *,
+    host: str,
+    port: int,
+    ssl_keyfile,
+    ssl_certfile,
+    ssl_keyfile_password,
+    ssl_ciphers: str,
+    min_tls_version,
+    access_log: bool,
+) -> None:
+    """Call start_uvicorn with mocked uvicorn internals and assert expectations."""
+    fake_uvicorn_config = SimpleNamespace(
+        ssl=SimpleNamespace(minimum_version=None),
+        loaded=False,
+    )
+    fake_uvicorn_config.load = Mock(
+        side_effect=lambda: setattr(fake_uvicorn_config, "loaded", True)
+    )
+    fake_server = SimpleNamespace(run=Mock())
+
+    with (
+        patch("ols.runners.uvicorn.uvicorn.Config") as mocked_config,
+        patch("ols.runners.uvicorn.uvicorn.Server") as mocked_server,
+    ):
+        mocked_config.return_value = fake_uvicorn_config
+        mocked_server.return_value = fake_server
+        start_uvicorn(config)
+
+        mocked_config.assert_called_once_with(
+            "ols.app.main:app",
+            host=host,
+            port=port,
+            workers=1,
+            log_level=30,
+            ssl_keyfile=ssl_keyfile,
+            ssl_certfile=ssl_certfile,
+            ssl_keyfile_password=ssl_keyfile_password,
+            ssl_version=ssl.PROTOCOL_TLS_SERVER,
+            ssl_ciphers=ssl_ciphers,
+            access_log=access_log,
+        )
+        assert fake_uvicorn_config.loaded is True
+        assert fake_uvicorn_config.ssl.minimum_version == min_tls_version
+        mocked_server.assert_called_once_with(fake_uvicorn_config)
+        fake_server.run.assert_called_once_with()
+
+
 def test_start_uvicorn_minimal_setup():
     """Test the function to start Uvicorn server."""
     config.reload_from_yaml_file(MINIMAL_CONFIG_FILE)
 
-    # don't start the real Uvicorn server
-    with patch("uvicorn.run") as mocked_runner:
-        start_uvicorn(config)
-        mocked_runner.assert_called_once_with(
-            "ols.app.main:app",
-            host="0.0.0.0",  # noqa: S104
-            port=8080,
-            workers=1,
-            log_level=30,
-            ssl_keyfile=None,
-            ssl_certfile=None,
-            ssl_keyfile_password=None,
-            ssl_version=ssl.PROTOCOL_TLS_SERVER,
-            ssl_ciphers=constants.DEFAULT_SSL_CIPHERS,
-            access_log=False,
-        )
+    _run_start_uvicorn_and_assert(
+        host="0.0.0.0",  # noqa: S104
+        port=8080,
+        ssl_keyfile=None,
+        ssl_certfile=None,
+        ssl_keyfile_password=None,
+        ssl_ciphers=constants.DEFAULT_SSL_CIPHERS,
+        min_tls_version=None,
+        access_log=False,
+    )
 
 
 def test_start_uvicorn_full_setup():
     """Test the function to start Uvicorn server."""
     config.reload_from_yaml_file(CORRECT_CONFIG_FILE)
-    # don't start the real Uvicorn server
-    with patch("uvicorn.run") as mocked_runner:
-        start_uvicorn(config)
-        mocked_runner.assert_called_once_with(
-            "ols.app.main:app",
-            host="0.0.0.0",  # noqa: S104
-            port=8080,
-            workers=1,
-            log_level=30,
-            ssl_keyfile="tests/config/key",
-            ssl_certfile="tests/config/empty_cert.crt",
-            ssl_keyfile_password="* this is password *",  # noqa: S106
-            ssl_version=ssl.TLSVersion.TLSv1_3,
-            ssl_ciphers="TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",  # noqa: E501
-            access_log=False,
-        )
+
+    _run_start_uvicorn_and_assert(
+        host="0.0.0.0",  # noqa: S104
+        port=8080,
+        ssl_keyfile="tests/config/key",
+        ssl_certfile="tests/config/empty_cert.crt",
+        ssl_keyfile_password="* this is password *",  # noqa: S106
+        ssl_ciphers="TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+        min_tls_version=ssl.TLSVersion.TLSv1_3,
+        access_log=False,
+    )
 
 
 @pytest.mark.filterwarnings("ignore")
