@@ -16,6 +16,9 @@ from tests.e2e.utils.wait_for_ols import wait_for_ols
 
 disconnected = os.getenv("DISCONNECTED", "")
 
+_OLS_APP_DEPLOYMENT_WAIT_ATTEMPTS = 60
+_OLS_APP_DEPLOYMENT_WAIT_INTERVAL_S = 10
+
 
 def apply_olsconfig(provider_list: list[str]) -> None:
     """Apply the correct OLSConfig CR based on provider configuration.
@@ -158,22 +161,15 @@ def wait_for_deployment() -> None:
     Ensures the lightspeed-app-server deployment is available and pods are running.
     """
     print("Waiting for OLS deployment to be available...")
-    retry_until_timeout_or_success(
+    if not retry_until_timeout_or_success(
         30,
         5,
-        lambda: cluster_utils.run_oc(
-            [
-                "get",
-                "deployment",
-                "lightspeed-app-server",
-                "--ignore-not-found",
-                "-o",
-                "name",
-            ]
-        ).stdout.strip()
-        == "deployment.apps/lightspeed-app-server",
+        lambda: cluster_utils.deployment_exists("lightspeed-app-server"),
         "Waiting for lightspeed-app-server deployment to be detected",
-    )
+    ):
+        raise RuntimeError(
+            "Timed out waiting for lightspeed-app-server Deployment to exist"
+        )
 
     print("Waiting for pods to be ready...")
     cluster_utils.wait_for_running_pod(wait_http_ready=False)
@@ -232,8 +228,7 @@ def _reconcile_olsconfig_with_operator(provider_list: list[str]) -> None:
             "1",
         ]
     )
-    # Wait for operator pod to be ready
-    retry_until_timeout_or_success(
+    if not retry_until_timeout_or_success(
         60,
         5,
         lambda: (
@@ -246,7 +241,10 @@ def _reconcile_olsconfig_with_operator(provider_list: list[str]) -> None:
             for status in cluster_utils.get_container_ready_status(pods[0])
         ),
         "Waiting for operator to be ready",
-    )
+    ):
+        raise RuntimeError(
+            "Timed out waiting for lightspeed-operator-controller-manager pod to be ready"
+        )
     try:
         cluster_utils.run_oc(
             ["delete", "olsconfig", "cluster", "--ignore-not-found", "--wait"]
@@ -264,24 +262,17 @@ def _reconcile_olsconfig_with_operator(provider_list: list[str]) -> None:
     print("Waiting for operator to reconcile OLSConfig CR (30 seconds)...")
     time.sleep(30)  # Let operator reconcile CR → deployment + configmap
 
-    # Verify reconciliation happened - check deployment exists AND has pods
     print("Verifying operator reconciliation completed...")
-    retry_until_timeout_or_success(
-        30,  # Give more time for operator to fully reconcile
-        3,
-        lambda: cluster_utils.run_oc(
-            [
-                "get",
-                "deployment",
-                "lightspeed-app-server",
-                "--ignore-not-found",
-                "-o",
-                "jsonpath={.status.replicas}",
-            ]
-        ).stdout.strip()
-        != "",
-        "Waiting for operator to create deployment with replicas",
-    )
+    if not retry_until_timeout_or_success(
+        _OLS_APP_DEPLOYMENT_WAIT_ATTEMPTS,
+        _OLS_APP_DEPLOYMENT_WAIT_INTERVAL_S,
+        lambda: cluster_utils.deployment_exists("lightspeed-app-server"),
+        "Waiting for operator to create lightspeed-app-server deployment",
+    ):
+        raise RuntimeError(
+            "Timed out waiting for lightspeed-app-server Deployment after OLSConfig "
+            "reconcile (includes image pull); check operator logs and OLSConfig status"
+        )
     cluster_utils.run_oc(
         [
             "scale",
@@ -291,31 +282,40 @@ def _reconcile_olsconfig_with_operator(provider_list: list[str]) -> None:
         ]
     )
 
-    retry_until_timeout_or_success(
+    if not retry_until_timeout_or_success(
         30,
         3,
         lambda: not cluster_utils.get_pod_by_prefix(
             prefix="lightspeed-operator-controller-manager", fail_not_found=False
         ),
         "Waiting for operator to scale down",
-    )
+    ):
+        raise RuntimeError(
+            "Timed out waiting for lightspeed-operator-controller-manager pod to terminate"
+        )
     print("Operator scaled down")
 
 
 def _apply_e2e_specific_config(ols_image: str) -> None:
     """Scale down app server, update configmap and image, then scale back up."""
-    # Scale down app server to apply e2e configurations
+    if not cluster_utils.deployment_exists("lightspeed-app-server"):
+        raise RuntimeError(
+            "lightspeed-app-server Deployment is missing; cannot apply e2e configuration"
+        )
     print("Scaling down app server to apply e2e configurations...")
     cluster_utils.run_oc(
         ["scale", "deployment/lightspeed-app-server", "--replicas", "0"]
     )
 
-    retry_until_timeout_or_success(
+    if not retry_until_timeout_or_success(
         30,
         3,
         lambda: not cluster_utils.get_pod_by_prefix(fail_not_found=False),
         "Waiting for app server pod to terminate",
-    )
+    ):
+        raise RuntimeError(
+            "Timed out waiting for lightspeed-app-server pods to terminate after scale to 0"
+        )
     print("App server scaled down")
 
     if not disconnected:
