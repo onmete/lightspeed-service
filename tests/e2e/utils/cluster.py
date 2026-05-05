@@ -97,6 +97,26 @@ def get_cluster_version() -> tuple[str, str]:
         raise Exception("Error getting cluster version") from e
 
 
+def deployment_exists(name: str, namespace: str = "openshift-lightspeed") -> bool:
+    """Return True if a Deployment exists in the namespace (``oc -o name`` shape varies)."""
+    name_line = run_oc(
+        [
+            "get",
+            "deployment",
+            name,
+            "-n",
+            namespace,
+            "--ignore-not-found",
+            "-o",
+            "name",
+        ]
+    ).stdout.strip()
+    return name_line in (
+        f"deployment.apps/{name}",
+        f"deployment/{name}",
+    )
+
+
 def lightspeed_operator_manager_deployed(
     namespace: str = "openshift-lightspeed",
 ) -> bool:
