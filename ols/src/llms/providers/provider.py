@@ -8,6 +8,7 @@ from typing import Any, Optional
 
 import httpx
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials as GoogleOAuth2UserCredentials
 from ibm_watsonx_ai.metanames import GenTextParamsMetaNames as GenParams
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.language_models.llms import LLM
@@ -132,6 +133,7 @@ GoogleVertexAnthropicParameters = {
     ProviderParameter("project", str),
     ProviderParameter("location", str),
     ProviderParameter("credentials", service_account.Credentials),
+    ProviderParameter("credentials", GoogleOAuth2UserCredentials),
     ProviderParameter("max_output_tokens", int),
     ProviderParameter("temperature", float),
     ProviderParameter("top_p", float),
@@ -143,7 +145,9 @@ GoogleVertexParameters = {
     ProviderParameter("project", str),
     ProviderParameter("location", str),
     ProviderParameter("vertexai", bool),
+    ProviderParameter("base_url", str),
     ProviderParameter("credentials", service_account.Credentials),
+    ProviderParameter("credentials", GoogleOAuth2UserCredentials),
     ProviderParameter("max_output_tokens", int),
     ProviderParameter("temperature", float),
     ProviderParameter("top_p", float),

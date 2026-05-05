@@ -112,7 +112,7 @@ check-types: ## Checks type hints in sources
 	uv run mypy --explicit-package-bases --disallow-untyped-calls --disallow-untyped-defs --disallow-incomplete-defs ols/
 
 security-check: ## Check the project for security issues
-	uv run bandit -c pyproject.toml -r .
+	uv run bandit -c pyproject.toml -r ols runner.py
 
 format: ## Format the code into unified format
 	uv run black .

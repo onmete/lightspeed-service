@@ -26,8 +26,7 @@ def test_providers_are_registered():
 
     # import after previous test to not influence the auto-registration
     from ols.src.llms.providers.fake_provider import FakeProvider
-    from ols.src.llms.providers.google_vertex import GoogleVertex
-    from ols.src.llms.providers.google_vertex_anthropic import GoogleVertexAnthropic
+    from ols.src.llms.providers.google_vertex import GoogleVertex, GoogleVertexAnthropic
     from ols.src.llms.providers.openai import OpenAI
     from ols.src.llms.providers.rhelai_vllm import RHELAIVLLM
     from ols.src.llms.providers.rhoai_vllm import RHOAIVLLM

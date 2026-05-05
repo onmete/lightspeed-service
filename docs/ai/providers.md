@@ -121,8 +121,8 @@ Unknown parameters (not in the provider's `ProviderParameter` set) are silently 
 | `PROVIDER_RHOAI_VLLM` | `rhoai_vllm.py` | `ChatOpenAI` (OpenAI-compatible) |
 | `PROVIDER_RHELAI_VLLM` | `rhelai_vllm.py` | `ChatOpenAI` (OpenAI-compatible) |
 | `PROVIDER_WATSONX` | `watsonx.py` | `WatsonxLLM` |
-| `PROVIDER_GOOGLE_VERTEX_ANTHROPIC` | `google_vertex_anthropic.py` | `ChatAnthropicVertex` (Claude on Vertex) |
+| `PROVIDER_GOOGLE_VERTEX_ANTHROPIC` | `google_vertex.py` | `ChatAnthropicVertex` (Claude on Vertex) |
 | `PROVIDER_GOOGLE_VERTEX` | `google_vertex.py` | `ChatGoogleGenerativeAI` |
 | `PROVIDER_FAKE` | `fake_provider.py` | `FakeListLLM` / `FakeStreamingListLLM` |
 
-Vertex AI in `olsconfig.yaml`: use `type: google_vertex_anthropic` with a `google_vertex_anthropic_config` block (`project`, `location`), or `type: google_vertex` with `google_vertex_config` (same shape).
+Vertex AI in `olsconfig.yaml`: use `type: google_vertex_anthropic` with a `google_vertex_anthropic_config` block (`project`, `location`), or `type: google_vertex` with `google_vertex_config` (same shape). The file referenced by `credentials_path` may be either a **service account key** (`type: service_account`) or **user OAuth JSON** (`type: authorized_user` with `refresh_token`, `client_id`, and `client_secret`). Each file must include the `type` field. Credentials are scoped for Vertex with the cloud-platform OAuth scope.
