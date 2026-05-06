@@ -222,8 +222,36 @@ def replace_ols_image(ols_image: str) -> None:
     )
 
 
+def ensure_azure_entra_id_secret() -> None:
+    """Create openshift-lightspeed/azure-entra-id when using Azure OpenAI with Entra ID."""
+    try:
+        tenant_id = os.environ["AZUREOPENAI_ENTRA_ID_TENANT_ID"]
+        client_id = os.environ["AZUREOPENAI_ENTRA_ID_CLIENT_ID"]
+        client_secret = os.environ["AZUREOPENAI_ENTRA_ID_CLIENT_SECRET"]
+    except KeyError as e:
+        raise RuntimeError(
+            f"Missing required Azure Entra environment variable: {e.args[0]}"
+        ) from e
+
+    print("Ensuring azure-entra-id secret exists...")
+    cluster_utils.run_oc(
+        [
+            "create",
+            "secret",
+            "generic",
+            "azure-entra-id",
+            f"--from-literal=tenant_id={tenant_id}",
+            f"--from-literal=client_id={client_id}",
+            f"--from-literal=client_secret={client_secret}",
+        ],
+        ignore_existing_resource=True,
+    )
+
+
 def create_secrets(provider_name: str, creds: str, provider_size: int) -> None:
-    """Create secrets for models.
+    """Create Kubernetes secrets needed for an LLM provider (API creds plus extras).
+
+    For ``azure_openai``, also ensures the ``azure-entra-id`` secret exists.
 
     Args:
         provider_name (str): the name of the provider.
@@ -276,6 +304,9 @@ def create_secrets(provider_name: str, creds: str, provider_size: int) -> None:
             ],
             ignore_existing_resource=True,
         )
+
+    if provider_name == "azure_openai":
+        ensure_azure_entra_id_secret()
 
 
 def install_ols() -> tuple[str, str, str]:  # pylint: disable=R0915, R0912  # noqa: C901
@@ -369,21 +400,6 @@ def install_ols() -> tuple[str, str, str]:  # pylint: disable=R0915, R0912  # no
     creds_list = creds.split()
     for i, prov in enumerate(provider_list):
         create_secrets(prov, creds_list[i], len(provider_list))
-
-    if provider == "azure_openai":
-        # create extra secrets with Entra ID
-        cluster_utils.run_oc(
-            [
-                "create",
-                "secret",
-                "generic",
-                "azure-entra-id",
-                f"--from-literal=tenant_id={os.environ['AZUREOPENAI_ENTRA_ID_TENANT_ID']}",
-                f"--from-literal=client_id={os.environ['AZUREOPENAI_ENTRA_ID_CLIENT_ID']}",
-                f"--from-literal=client_secret={os.environ['AZUREOPENAI_ENTRA_ID_CLIENT_SECRET']}",
-            ],
-            ignore_existing_resource=True,
-        )
 
     # create the olsconfig operand
     try:

@@ -11,6 +11,7 @@ import yaml
 from ols.constants import DEFAULT_CONFIGURATION_FILE
 from tests.e2e.utils import cluster as cluster_utils
 from tests.e2e.utils.data_collector_control import configure_exporter_for_e2e_tests
+from tests.e2e.utils.ols_installer import ensure_azure_entra_id_secret
 from tests.e2e.utils.retry import retry_until_timeout_or_success
 from tests.e2e.utils.wait_for_ols import wait_for_ols
 
@@ -412,6 +413,8 @@ def adapt_ols_config() -> tuple[str, str, str]:
 
     Ensures RBAC, service accounts, and OLS route exist for test execution.
     This function assumes the operator has already been scaled down during initial setup.
+    Pytest usually runs ``ols_installer.create_secrets`` before this; we still ensure
+    Azure Entra ID secrets here so ``adapt`` is safe when invoked standalone.
 
     Returns:
         tuple: (ols_url, token, metrics_token)
@@ -423,6 +426,8 @@ def adapt_ols_config() -> tuple[str, str, str]:
     namespace = "openshift-lightspeed"
 
     _scale_down_existing_app_server()
+    if "azure_openai" in provider_list:
+        ensure_azure_entra_id_secret()
     _reconcile_olsconfig_with_operator(provider_list)
     _apply_e2e_specific_config(ols_image)
     token, metrics_token = _setup_access_and_tokens(namespace)
