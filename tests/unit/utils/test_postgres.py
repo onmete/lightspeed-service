@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, call, patch
 import psycopg2
 import pytest
 
+from ols.app.models.config import TLSSecurityProfile
 from ols.utils.postgres import PostgresBase, connection
 
 
@@ -165,3 +166,44 @@ class TestPostgresBaseConnected:
             psycopg2.InterfaceError("cannot reach server")
         )
         assert component.connected() is False
+
+
+class TestPostgresBaseTlsProfile:
+    """Tests for TLS security profile integration in PostgresBase."""
+
+    def _mock_config(self, profile: TLSSecurityProfile | None = None) -> MagicMock:
+        """Return a MagicMock PostgresConfig with the given TLS profile."""
+        cfg = MagicMock()
+        cfg.ca_cert_path = None
+        cfg.tls_security_profile = profile
+        return cfg
+
+    def test_ssl_min_protocol_version_passed_when_profile_set(self):
+        """Verify psycopg2.connect receives ssl_min_protocol_version."""
+        profile = TLSSecurityProfile()
+        profile.profile_type = "IntermediateType"
+
+        with patch("psycopg2.connect") as mock_connect:
+            FakeComponent(config=self._mock_config(profile))
+
+        kwargs = mock_connect.call_args.kwargs
+        assert kwargs.get("ssl_min_protocol_version") == "TLSv1.2"
+
+    def test_ssl_min_protocol_version_not_passed_when_no_profile(self):
+        """Verify psycopg2.connect has no ssl_min_protocol_version without profile."""
+        with patch("psycopg2.connect") as mock_connect:
+            FakeComponent(config=self._mock_config())
+
+        kwargs = mock_connect.call_args.kwargs
+        assert "ssl_min_protocol_version" not in kwargs
+
+    def test_ssl_min_protocol_version_not_passed_when_profile_type_is_none(self):
+        """Verify psycopg2.connect skips enforcement when profile_type is None."""
+        profile = TLSSecurityProfile()
+        profile.profile_type = None
+
+        with patch("psycopg2.connect") as mock_connect:
+            FakeComponent(config=self._mock_config(profile))
+
+        kwargs = mock_connect.call_args.kwargs
+        assert "ssl_min_protocol_version" not in kwargs

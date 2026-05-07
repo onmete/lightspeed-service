@@ -182,19 +182,54 @@ def test_connect():
     """Test the connection to Postgres."""
     exception_message = "Exception during PostgreSQL storage."
 
-    # connection won't be established
     config = PostgresConfig()
 
-    # don't connect to real PostgreSQL instance
     with patch("psycopg2.connect") as mock_connect:
         mock_connect.return_value.cursor.return_value.execute.side_effect = Exception(
             exception_message
         )
-        # try to connect to mocked Postgres
         connection = connect(config)
 
-        # connection should not be established
         assert connection is not None
+
+
+def test_connect_passes_sslrootcert():
+    """Verify connect passes sslrootcert to psycopg2.connect."""
+    config = PostgresConfig()
+    config.ca_cert_path = "/certs/ca.pem"
+
+    with patch("psycopg2.connect") as mock_connect:
+        connect(config)
+
+    kwargs = mock_connect.call_args
+    assert kwargs.kwargs.get("sslrootcert") == "/certs/ca.pem"
+
+
+def test_connect_passes_ssl_min_protocol_version_when_profile_set():
+    """Verify connect passes ssl_min_protocol_version when profile is on config."""
+    from ols.app.models.config import TLSSecurityProfile
+
+    config = PostgresConfig()
+    profile = TLSSecurityProfile()
+    profile.profile_type = "IntermediateType"
+    config.tls_security_profile = profile
+
+    with patch("psycopg2.connect") as mock_connect:
+        connect(config)
+
+    kwargs = mock_connect.call_args.kwargs
+    assert kwargs.get("ssl_min_protocol_version") == "TLSv1.2"
+
+
+def test_connect_no_ssl_min_protocol_version_without_profile():
+    """Verify connect has no ssl_min_protocol_version without a TLS profile."""
+    config = PostgresConfig()
+
+    with patch("psycopg2.connect") as mock_connect:
+        connect(config)
+
+    kwargs = mock_connect.call_args.kwargs
+    assert "ssl_min_protocol_version" not in kwargs
 
 
 def test_get_subject_id():

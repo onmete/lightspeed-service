@@ -131,7 +131,7 @@ POSTGRES_CACHE_MAX_ENTRIES = 1000
 
 # look at https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLMODE
 # for all possible options
-POSTGRES_CACHE_SSL_MODE = "prefer"
+POSTGRES_CACHE_SSL_MODE = "require"
 
 # look at https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-GSSENCMODE
 # for all possible options

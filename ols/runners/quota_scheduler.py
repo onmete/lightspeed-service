@@ -10,6 +10,7 @@ import psycopg2
 from ols import constants
 from ols.app.models.config import LimiterConfig, PostgresConfig, QuotaHandlersConfig
 from ols.utils.config import AppConfig
+from ols.utils.ssl import libpq_tls_params
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -158,16 +159,18 @@ def get_subject_id(limiter_type: str) -> str:
 def connect(config: PostgresConfig) -> Any:
     """Initialize connection to database."""
     logger.info("Initializing connection to quota limiter database")
-    connection = psycopg2.connect(
-        host=config.host,
-        port=config.port,
-        user=config.user,
-        password=config.password,
-        dbname=config.dbname,
-        sslmode=config.ssl_mode,
-        # sslrootcert=config.ca_cert_path,
-        gssencmode=config.gss_encmode,
-    )
+    connect_kwargs: dict[str, Any] = {
+        "host": config.host,
+        "port": config.port,
+        "user": config.user,
+        "password": config.password,
+        "dbname": config.dbname,
+        "sslmode": config.ssl_mode,
+        "sslrootcert": config.ca_cert_path,
+        "gssencmode": config.gss_encmode,
+        **libpq_tls_params(config.tls_security_profile),
+    }
+    connection = psycopg2.connect(**connect_kwargs)
     if connection is not None:
         connection.autocommit = True
     return connection

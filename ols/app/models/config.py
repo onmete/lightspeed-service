@@ -798,6 +798,7 @@ class PostgresConfig(BaseModel):
     gss_encmode: str = constants.POSTGRES_CACHE_GSSENCMODE
     ca_cert_path: Optional[FilePath] = None
     max_entries: PositiveInt = constants.POSTGRES_CACHE_MAX_ENTRIES
+    tls_security_profile: Optional["TLSSecurityProfile"] = None
 
     def __init__(self, **data: Any) -> None:
         """Initialize configuration."""
@@ -1209,6 +1210,7 @@ class OLSConfig(BaseModel):
             data.get("tlsSecurityProfile", None)
         )
         self.quota_handlers = QuotaHandlersConfig(data.get("quota_handlers", None))
+        self._propagate_tls_profile()
         self.proxy_config = ProxyConfig(data.get("proxy_config"))
         if data.get("tool_filtering", None) is not None:
             self.tool_filtering = ToolFilteringConfig(**data.get("tool_filtering"))
@@ -1231,6 +1233,20 @@ class OLSConfig(BaseModel):
         self.offload_storage_path = data.get(
             "offload_storage_path", constants.DEFAULT_OFFLOAD_STORAGE_PATH
         )
+
+    def _propagate_tls_profile(self) -> None:
+        """Set the TLS security profile on all PostgresConfig instances."""
+        if (
+            self.tls_security_profile is None
+            or self.tls_security_profile.profile_type is None
+        ):
+            return
+        if self.conversation_cache and self.conversation_cache.postgres:
+            self.conversation_cache.postgres.tls_security_profile = (
+                self.tls_security_profile
+            )
+        if self.quota_handlers and self.quota_handlers.storage:
+            self.quota_handlers.storage.tls_security_profile = self.tls_security_profile
 
     def validate_yaml(self, disable_tls: bool = False) -> None:
         """Validate OLS config."""
