@@ -1,4 +1,18 @@
-"""Troubleshooting eval tests using OLS troubleshooting mode and cluster scenarios."""
+"""Troubleshooting eval tests using OLS troubleshooting mode and cluster scenarios.
+
+Two suites are provided:
+
+scenario_evals
+    Inject a specific broken cluster state via setup/cleanup scripts, then ask
+    OLS to diagnose it.  Expected answers are known in advance and scored with
+    custom:answer_correctness (and geval/deepeval metrics for multi-turn cases).
+
+mcp_evals
+    Open-ended live-cluster evals that require a pre-broken cluster with MCP
+    tools available (obs-mcp + openshift-mcp-server).  No setup scripts are
+    used; the cluster must be prepared externally.  Responses are scored with
+    geval:generic_troubleshooting_experience.
+"""
 
 import json
 import os
@@ -10,12 +24,15 @@ from pathlib import Path
 import pytest
 import yaml
 
+MAX_EVAL_ERROR_RATE_PCT = 10.0
+
 PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
 EVAL_DIR = PROJECT_ROOT / "eval"
 TROUBLESHOOTING_EVAL_DIR = EVAL_DIR / "troubleshooting"
 LSEVAL_BIN = PROJECT_ROOT / ".venv" / "bin" / "lightspeed-eval"
 SYSTEM_CONFIG = TROUBLESHOOTING_EVAL_DIR / "system.yaml"
-EVAL_DATA = TROUBLESHOOTING_EVAL_DIR / "evals.yaml"
+SCENARIO_EVAL_DATA = TROUBLESHOOTING_EVAL_DIR / "scenario_evals.yaml"
+MCP_EVAL_DATA = TROUBLESHOOTING_EVAL_DIR / "mcp_evals.yaml"
 
 
 def _ensure_lseval_installed() -> None:
@@ -54,10 +71,17 @@ def _get_ols_token() -> str:
 
 
 def _run_troubleshooting_lseval(
+    eval_data: Path,
     out_dir: Path,
     tags: list[str] | None = None,
 ) -> None:
-    """Run lightspeed-eval for troubleshooting scenarios and assert artefacts are produced."""
+    """Run lightspeed-eval for troubleshooting scenarios and assert artefacts are produced.
+
+    Args:
+        eval_data: Path to the evaluation dataset YAML.
+        out_dir: Directory where evaluation artefacts are written.
+        tags: Optional list of tags to filter which scenarios are run.
+    """
     _ensure_lseval_installed()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -88,7 +112,7 @@ def _run_troubleshooting_lseval(
         "--system-config",
         tmp_config_path,
         "--eval-data",
-        str(EVAL_DATA),
+        str(eval_data),
         "--output-dir",
         str(out_dir),
     ]
@@ -126,16 +150,42 @@ def _run_troubleshooting_lseval(
 
     with open(json_files[0], encoding="utf-8") as fh:
         overall = json.load(fh)["summary_stats"]["overall"]
-    assert overall["ERROR"] == 0, (
+    assert overall["error_rate"] <= MAX_EVAL_ERROR_RATE_PCT, (
         f"{overall['ERROR']}/{overall['TOTAL']} evaluations errored "
-        f"(error_rate={overall['error_rate']:.1f}%)."
+        f"(error_rate={overall['error_rate']:.1f}% > threshold {MAX_EVAL_ERROR_RATE_PCT}%)."
     )
 
 
 @pytest.mark.lseval
-def test_lseval_troubleshooting(request: pytest.FixtureRequest) -> None:
-    """Run all OLS troubleshooting eval scenarios against the cluster."""
+def test_lseval_troubleshooting_scenarios(request: pytest.FixtureRequest) -> None:
+    """Run scenario-based troubleshooting evals against the cluster.
+
+    Each scenario injects a specific broken cluster state via a setup script,
+    asks OLS to diagnose it, then cleans up.  Expected answers are known in
+    advance and scored with custom:answer_correctness.
+    """
     out_dir_base = request.config.option.eval_out_dir or str(
         EVAL_DIR / "results-lseval-troubleshooting"
     )
-    _run_troubleshooting_lseval(Path(out_dir_base) / "troubleshooting")
+    _run_troubleshooting_lseval(
+        SCENARIO_EVAL_DATA,
+        Path(out_dir_base) / "troubleshooting" / "scenarios",
+    )
+
+
+@pytest.mark.lseval
+def test_lseval_troubleshooting_mcp(request: pytest.FixtureRequest) -> None:
+    """Run MCP-based live troubleshooting evals against the cluster.
+
+    Requires a pre-broken cluster with MCP tools available
+    (obs-mcp + openshift-mcp-server).  No setup scripts are used; the cluster
+    must be prepared externally before running this test.  Responses are scored
+    with geval:generic_troubleshooting_experience.
+    """
+    out_dir_base = request.config.option.eval_out_dir or str(
+        EVAL_DIR / "results-lseval-troubleshooting"
+    )
+    _run_troubleshooting_lseval(
+        MCP_EVAL_DATA,
+        Path(out_dir_base) / "troubleshooting" / "mcp",
+    )

@@ -1,16 +1,16 @@
 #!/bin/bash
-# CI job: run LSEval full dataset (797 questions) against OLS using OpenAI GPT-4o-mini + GPT-4.1-mini judge.
+# CI job: run LSEval evaluations against OLS using OpenAI GPT-4o-mini + GPT-4.1-mini judge.
+#
+# Runs two suites in sequence against the same OLS deployment:
+#   1. lseval_periodic          — full 797-question QnA dataset
+#   2. lseval_troubleshooting   — scenario-based and MCP troubleshooting evals
+#
+# After both suites complete, summary JSONs are recorded into
+# eval/results/history.csv and weekly trend plots are written to ARTIFACT_DIR.
 #
 # Input environment variables:
 #   OPENAI_PROVIDER_KEY_PATH  - path to file containing the OpenAI API key
 #   OLS_IMAGE                 - pullspec for the OLS container image to deploy
-#
-# Script flow:
-#   1. Install OLS dependencies
-#   2. Install operator-sdk
-#   3. Deploy OLS on the cluster (openai_lseval config via run_suite)
-#   4. Run the LSEval full-dataset pytest test (make test-lseval-periodic)
-#   5. Collect artefacts and clean up
 
 set -eou pipefail
 
@@ -37,19 +37,42 @@ function run_suites() {
   local rc=0
 
   set +e
-  # Deploy OLS with OpenAI GPT-4o-mini and run LSEval full-dataset evaluation (797 questions).
+  # Deploy OLS with OpenAI GPT-4o-mini.
   # run_suite arguments: suiteid test_tags provider provider_keypath model ols_image ols_config_suffix
   # OLS_CONFIG_SUFFIX="lseval" → ols_installer builds: olsconfig.crd.openai_lseval.yaml
-  run_suite "lseval_periodic" "lseval" "openai" "$OPENAI_PROVIDER_KEY_PATH" "gpt-4o-mini" "$OLS_IMAGE" "lseval"
+
+  # Suite 1: full 797-question QnA dataset
+  SUITE_ID="lseval_periodic" run_suite \
+    "lseval_periodic" "lseval" "openai" "$OPENAI_PROVIDER_KEY_PATH" "gpt-4o-mini" "$OLS_IMAGE" "lseval"
   (( rc = rc || $? ))
+
+  # Suite 2: scenario-based and MCP troubleshooting evals (same OLS deployment)
+  SUITE_ID="lseval_troubleshooting" make test-lseval-troubleshooting
+  (( rc = rc || $? ))
+
   set -e
 
   cleanup_ols_operator
-
   return $rc
 }
 
+function record_trends() {
+  # Collect run summaries and regenerate trend plots.
+  # Missing JSONs are silently skipped (suite may have errored before producing output).
+  uv run --extra evaluation python eval/scripts/update_eval_trends.py \
+    --suite lseval_periodic \
+    --summary-json "${ARTIFACT_DIR}/lseval/openai/evaluation_summary.json" \
+    --suite lseval_troubleshooting_scenarios \
+    --summary-json "${ARTIFACT_DIR}/troubleshooting/scenarios/evaluation_summary.json" \
+    --suite lseval_troubleshooting_mcp \
+    --summary-json "${ARTIFACT_DIR}/troubleshooting/mcp/evaluation_summary.json" \
+    --history-csv eval/score_history.csv \
+    --output-dir "${ARTIFACT_DIR}" \
+    || echo "WARNING: trend update failed (non-fatal)"
+}
+
 function finish() {
+  record_trends
   if [ "${LOCAL_MODE:-0}" -eq 1 ]; then
     rm -rf "$ARTIFACT_DIR"
   fi

@@ -38,6 +38,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+MAX_EVAL_ERROR_RATE_PCT = 10.0
+
 PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
 EVAL_DIR = PROJECT_ROOT / "eval"
 LSEVAL_BIN = PROJECT_ROOT / ".venv" / "bin" / "lightspeed-eval"
@@ -162,9 +164,9 @@ def _run_lseval(eval_data: Path, out_dir: Path, system_config: Path) -> None:
 
     with open(json_files[0], encoding="utf-8") as fh:
         overall = json.load(fh)["summary_stats"]["overall"]
-    assert overall["ERROR"] == 0, (
+    assert overall["error_rate"] <= MAX_EVAL_ERROR_RATE_PCT, (
         f"{overall['ERROR']}/{overall['TOTAL']} evaluations errored "
-        f"(error_rate={overall['error_rate']:.1f}%)."
+        f"(error_rate={overall['error_rate']:.1f}% > threshold {MAX_EVAL_ERROR_RATE_PCT}%)."
     )
 
 

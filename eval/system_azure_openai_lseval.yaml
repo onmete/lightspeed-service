@@ -1,6 +1,6 @@
 # LightSpeed Evaluation Framework Configuration
 # OLS Provider: Azure OpenAI gpt-4.1-mini (model being evaluated)
-# Judge LLM: OpenAI GPT-4.1-mini (scoring responses)
+# Judge LLM: OpenAI GPT-5-mini (scoring responses)
 
 # Core Evaluation Configuration
 # Limits concurrent evaluations to avoid OpenAI API rate limiting on the judge LLM.
@@ -13,7 +13,7 @@ core:
 # Requires OPENAI_API_KEY environment variable.
 llm:
   provider: "openai"
-  model: "gpt-4.1-mini"
+  model: "gpt-5-mini"
   temperature: 0.0
   max_tokens: 512
   timeout: 300
