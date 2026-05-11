@@ -33,13 +33,13 @@ The LLM provider subsystem translates a (provider name, model name) pair from co
 | `watsonx.py` | `Watsonx` | `"watsonx"` | `ChatWatsonx` | IBM-specific parameter names; see below |
 | `rhoai_vllm.py` | `RHOAIVLLM` | `"rhoai_vllm"` | `ChatOpenAI` | OpenAI-compatible, no default URL |
 | `rhelai_vllm.py` | `RHELAIVLLM` | `"rhelai_vllm"` | `ChatOpenAI` | OpenAI-compatible, no default URL |
-| `google_vertex.py` | `GoogleVertex` | `"google_vertex"` | `ChatGoogleGenerativeAI` | Service account credentials from JSON |
-| `google_vertex_anthropic.py` | `GoogleVertexAnthropic` | `"google_vertex_anthropic"` | `ChatAnthropicVertex` | Anthropic models on Vertex Model Garden |
+| `google_vertex.py` | `GoogleVertex` | `"google_vertex"` | `ChatGoogleGenerativeAI` | Gemini / publisher models; credentials via `load_vertex_credentials` |
+| `google_vertex.py` | `GoogleVertexAnthropic` | `"google_vertex_anthropic"` | `ChatAnthropicVertex` | Claude on Vertex Model Garden; same module |
 | `fake_provider.py` | `FakeProvider` | `"fake_provider"` | `FakeListLLM` / `FakeStreamingListLLM` | Testing only; monkey-patches `bind_tools` |
 
 ### `ols/src/llms/providers/utils.py` -- Shared utilities
 
-- `credentials_str_to_dict(credentials_json)` -- Parses a JSON string of service account credentials into a dict. Used by both Google Vertex providers.
+- `load_vertex_credentials(credentials_json)` -- Builds Google credentials for Vertex from JSON (`service_account` or `authorized_user` types).
 - `VERTEX_AI_OAUTH_SCOPES` -- OAuth scope tuple for Vertex AI API access.
 
 ## Data Flow

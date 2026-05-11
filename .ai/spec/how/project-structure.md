@@ -46,8 +46,7 @@ OpenShift LightSpeed (OLS) is a FastAPI service organized into four layers: `app
 | `src/llms/providers/watsonx.py` | IBM WatsonX provider implementation. |
 | `src/llms/providers/rhoai_vllm.py` | Red Hat OpenShift AI vLLM provider. |
 | `src/llms/providers/rhelai_vllm.py` | RHEL AI vLLM provider. |
-| `src/llms/providers/google_vertex.py` | Google Vertex AI provider. |
-| `src/llms/providers/google_vertex_anthropic.py` | Google Vertex AI (Anthropic models) provider. |
+| `src/llms/providers/google_vertex.py` | Google Vertex AI (Gemini and Anthropic Claude on Vertex). |
 | `src/llms/providers/fake_provider.py` | Fake provider for testing and load testing. |
 | `src/prompts/prompts.py` | System prompt templates (`QUERY_SYSTEM_INSTRUCTION`, `TROUBLESHOOTING_SYSTEM_INSTRUCTION`). |
 | `src/prompts/prompt_generator.py` | `GeneratePrompt` class that assembles `ChatPromptTemplate` from query, RAG context, history, system prompt, tool-calling flag, mode, cluster version, and optional skill content. |
