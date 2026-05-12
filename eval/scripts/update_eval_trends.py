@@ -11,11 +11,11 @@ Usage::
 
     python eval/scripts/update_eval_trends.py \
         --suite lseval_periodic \
-        --summary-json /logs/artifacts/lseval/openai/evaluation_summary.json \
+        --summary-json /logs/artifacts/lseval/openai/evaluation_YYYYMMDD_summary.json \
         --suite lseval_troubleshooting_scenarios \
-        --summary-json /logs/artifacts/troubleshooting/scenarios/evaluation_summary.json \
+        --summary-json /logs/artifacts/troubleshooting/scenarios/evaluation_YYYYMMDD_summary.json \
         --suite lseval_troubleshooting_mcp \
-        --summary-json /logs/artifacts/troubleshooting/mcp/evaluation_summary.json \
+        --summary-json /logs/artifacts/troubleshooting/mcp/evaluation_YYYYMMDD_summary.json \
         --history-csv eval/score_history.csv \
         --output-dir /logs/artifacts \
         [--date 2026-04-30]
@@ -151,6 +151,7 @@ def _rows_from_summary(summary: dict, suite: str, date: str) -> list[dict]:
 
 
 def _append_to_history(history_csv: Path, rows: list[dict]) -> None:
+    history_csv.parent.mkdir(parents=True, exist_ok=True)
     write_header = not history_csv.exists() or history_csv.stat().st_size == 0
     with open(history_csv, "a", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=_HISTORY_COLUMNS)
@@ -204,7 +205,20 @@ def _plot_metric(
 
 
 def _generate_plots(history_csv: Path, output_dir: Path) -> None:
-    df = pd.read_csv(history_csv, parse_dates=["date"])
+    if not history_csv.is_file():
+        print(
+            f"No history CSV at {history_csv} — skipping trend plots.",
+            file=sys.stderr,
+        )
+        return
+    try:
+        df = pd.read_csv(history_csv, parse_dates=["date"])
+    except (FileNotFoundError, PermissionError, OSError) as e:
+        print(
+            f"Could not read history CSV {history_csv}: {e} — skipping trend plots.",
+            file=sys.stderr,
+        )
+        return
     df = df.dropna(subset=["date"]).sort_values("date")
 
     if df.empty:
@@ -256,7 +270,13 @@ def main() -> None:
         _append_to_history(args.history_csv, all_rows)
         print(f"Appended {len(all_rows)} total row(s) to {args.history_csv}")
 
-    _generate_plots(args.history_csv, args.output_dir)
+    try:
+        _generate_plots(args.history_csv, args.output_dir)
+    except Exception as e:
+        print(
+            f"WARNING: trend plot step failed (non-fatal): {e}",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":

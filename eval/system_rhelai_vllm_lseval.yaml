@@ -1,6 +1,6 @@
 # LightSpeed Evaluation Framework Configuration
 # OLS Provider: RHEL AI vLLM (model being evaluated)
-# Judge LLM: OpenAI GPT-4.1-mini (scoring responses)
+# Judge LLM: OpenAI GPT-5-mini (scoring responses)
 #
 # The default model "gpt-3.5-turbo" is the alias registered in the vLLM deployment.
 # Override it for your deployment via the LSEVAL_OLS_MODEL environment variable, e.g.:

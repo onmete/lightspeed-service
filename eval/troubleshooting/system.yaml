@@ -1,5 +1,6 @@
 # LightSpeed Evaluation Framework Configuration — Troubleshooting Evals
-# Default provider: OpenAI gpt-4o-mini (OLS backend) + OpenAI gpt-4.1-mini (judge)
+# OLS backend (api): model sent to OLS /query — align with cluster OLSConfig.
+# Judge (llm): OpenAI GPT-5-mini for scoring (GPT-5 family; avoid deprecated GPT-4 judge).
 #
 # api_base is overridden at runtime with the actual OLS cluster URL.
 # Requires OPENAI_API_KEY for the judge LLM.
@@ -36,7 +37,7 @@ api:
 embedding:
   cache_enabled: false
 
-# Metrics metadata — registers every metric used in evals.yaml
+# Metrics metadata — registers every metric used in scenario_evals.yaml
 metrics_metadata:
   turn_level:
     "custom:answer_correctness":
