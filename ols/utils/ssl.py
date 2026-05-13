@@ -1,14 +1,51 @@
-"""Utility function for retrieving SSL version and list of ciphers for TLS security profile."""
+"""Utility functions for TLS security profile enforcement."""
 
 import logging
 import ssl
-from typing import Optional
+from typing import Any, Optional
 
 from ols import constants
 from ols.app.models.config import TLSSecurityProfile
 from ols.utils import tls
 
 logger = logging.getLogger(__name__)
+
+
+_LIBPQ_TLS_VERSION_MAP: dict[ssl.TLSVersion, str] = {
+    ssl.TLSVersion.TLSv1: "TLSv1",
+    ssl.TLSVersion.TLSv1_1: "TLSv1.1",
+    ssl.TLSVersion.TLSv1_2: "TLSv1.2",
+    ssl.TLSVersion.TLSv1_3: "TLSv1.3",
+}
+
+
+def libpq_tls_params(
+    sec_profile: Optional[TLSSecurityProfile],
+) -> dict[str, Any]:
+    """Return extra libpq connection kwargs enforcing the TLS security profile.
+
+    Maps the OpenShift TLS security profile to libpq's
+    ``ssl_min_protocol_version`` parameter.  Returns an empty dict when no
+    profile is configured so the caller can simply ``**``-merge it.
+
+    Cipher enforcement is not supported by libpq on the client side —
+    cipher negotiation is controlled by the PostgreSQL server's
+    ``ssl_ciphers`` setting.
+    """
+    if sec_profile is None or sec_profile.profile_type is None:
+        return {}
+
+    min_version = get_min_tls_version(sec_profile)
+    if min_version is None:
+        return {}
+
+    libpq_value = _LIBPQ_TLS_VERSION_MAP.get(min_version)
+    if libpq_value is None:
+        logger.warning("Unmapped TLS version %s, skipping enforcement", min_version)
+        return {}
+
+    logger.info("Enforcing Postgres ssl_min_protocol_version=%s", libpq_value)
+    return {"ssl_min_protocol_version": libpq_value}
 
 
 def get_ssl_version(sec_profile: Optional[TLSSecurityProfile]) -> int:

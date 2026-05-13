@@ -11,6 +11,7 @@ from typing import Any, Callable
 import psycopg2
 
 from ols.app.models.config import PostgresConfig
+from ols.utils.ssl import libpq_tls_params
 
 logger = logging.getLogger(__name__)
 
@@ -57,16 +58,18 @@ class PostgresBase(ABC):
         logger.info("Establishing connection to Postgres")
         self.connection = None
         config = self.connection_config
-        self.connection = psycopg2.connect(
-            host=config.host,
-            port=config.port,
-            user=config.user,
-            password=config.password,
-            dbname=config.dbname,
-            sslmode=config.ssl_mode,
-            sslrootcert=config.ca_cert_path,
-            gssencmode=config.gss_encmode,
-        )
+        connect_kwargs: dict[str, Any] = {
+            "host": config.host,
+            "port": config.port,
+            "user": config.user,
+            "password": config.password,
+            "dbname": config.dbname,
+            "sslmode": config.ssl_mode,
+            "sslrootcert": config.ca_cert_path,
+            "gssencmode": config.gss_encmode,
+            **libpq_tls_params(config.tls_security_profile),
+        }
+        self.connection = psycopg2.connect(**connect_kwargs)
         try:
             cursor = self.connection.cursor()
             cursor.execute("SET LOCAL lock_timeout = '60s'")
