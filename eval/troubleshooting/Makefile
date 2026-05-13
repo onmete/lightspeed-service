@@ -9,7 +9,7 @@
 
 EVAL_CMD = API_KEY=$$(oc whoami -t) lightspeed-eval \
            --system-config system.yaml \
-           --eval-data evals.yaml \
+           --eval-data scenario_evals.yaml \
            --output-dir results
 
 all: envvar_missing batch_failure storage_binding \

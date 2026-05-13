@@ -5,8 +5,8 @@
 #   1. lseval_periodic          — full 797-question QnA dataset
 #   2. lseval_troubleshooting   — scenario-based and MCP troubleshooting evals
 #
-# After both suites complete, summary JSONs are recorded into
-# eval/results/history.csv and weekly trend plots are written to ARTIFACT_DIR.
+# After both suites complete, scores are appended to eval/score_history.csv and
+# weekly trend plots are written to ARTIFACT_DIR.
 #
 # Input environment variables:
 #   OPENAI_PROVIDER_KEY_PATH  - path to file containing the OpenAI API key
@@ -15,6 +15,7 @@
 set -eou pipefail
 
 make install-deps && make install-deps-test
+uv sync --extra evaluation --extra lseval
 
 DIR="${BASH_SOURCE%/*}"
 if [[ ! -d "$DIR" ]]; then DIR="$PWD"; fi
@@ -56,19 +57,50 @@ function run_suites() {
   return $rc
 }
 
+# lightspeed-eval writes evaluation_<timestamp>_summary.json (see eval/README.md).
+_newest_eval_summary() {
+  local dir="$1" f best="" best_t=-1 t
+  [[ -d "$dir" ]] || return 0
+  shopt -s nullglob
+  for f in "$dir"/evaluation_*_summary.json; do
+    [[ -f "$f" ]] || continue
+    t=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+    if (( t > best_t )); then
+      best_t=$t
+      best=$f
+    fi
+  done
+  printf '%s' "$best"
+}
+
 function record_trends() {
   # Collect run summaries and regenerate trend plots.
   # Missing JSONs are silently skipped (suite may have errored before producing output).
-  uv run --extra evaluation python eval/scripts/update_eval_trends.py \
-    --suite lseval_periodic \
-    --summary-json "${ARTIFACT_DIR}/lseval/openai/evaluation_summary.json" \
-    --suite lseval_troubleshooting_scenarios \
-    --summary-json "${ARTIFACT_DIR}/troubleshooting/scenarios/evaluation_summary.json" \
-    --suite lseval_troubleshooting_mcp \
-    --summary-json "${ARTIFACT_DIR}/troubleshooting/mcp/evaluation_summary.json" \
-    --history-csv eval/score_history.csv \
-    --output-dir "${ARTIFACT_DIR}" \
-    || echo "WARNING: trend update failed (non-fatal)"
+  mkdir -p eval
+  local periodic scenarios mcp
+  periodic="$(_newest_eval_summary "${ARTIFACT_DIR}/lseval/openai")"
+  scenarios="$(_newest_eval_summary "${ARTIFACT_DIR}/troubleshooting/scenarios")"
+  mcp="$(_newest_eval_summary "${ARTIFACT_DIR}/troubleshooting/mcp")"
+  if [[ -z "$periodic" && -z "$scenarios" && -z "$mcp" ]]; then
+    echo "WARNING: no evaluation_*_summary.json under ${ARTIFACT_DIR}, skipping trend update"
+    return 0
+  fi
+  local -a trend_cmd=(
+    uv run --extra evaluation python eval/scripts/update_eval_trends.py
+    --history-csv eval/score_history.csv
+    --output-dir "${ARTIFACT_DIR}"
+  )
+  if [[ -n "$periodic" ]]; then
+    trend_cmd+=(--suite lseval_periodic --summary-json "$periodic")
+  fi
+  if [[ -n "$scenarios" ]]; then
+    trend_cmd+=(--suite lseval_troubleshooting_scenarios --summary-json "$scenarios")
+  fi
+  if [[ -n "$mcp" ]]; then
+    trend_cmd+=(--suite lseval_troubleshooting_mcp --summary-json "$mcp")
+  fi
+  "${trend_cmd[@]}" || true
+  return 0
 }
 
 function finish() {
