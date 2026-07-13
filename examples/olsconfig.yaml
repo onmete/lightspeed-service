@@ -8,6 +8,11 @@ llm_providers:
     models:
       - name: model-name-1
       - name: model-name-2
+        # Reasoning model settings (GPT-5, o-series). Omit for non-reasoning models.
+        # parameters:
+        #   reasoning_effort: low      # low | medium | high (default: low)
+        #   reasoning_summary: concise  # auto | concise | detailed (default: concise)
+        #   verbosity: low             # low | medium | high (default: low)
   - name: my_azure_openai
     type: azure_openai
     url: "https://myendpoint.openai.azure.com/"
@@ -35,6 +40,33 @@ llm_providers:
     credentials_path: rhelai_api_key.txt
     models:
       - name: model-name
+  - name: my_google_vertex
+    type: google_vertex_anthropic
+    url: "https://us-east5-aiplatform.googleapis.com"
+    credentials_path: gcp_credentials.txt
+    project_id: my-gcp-project
+    google_vertex_anthropic_config:
+      project: my-gcp-project
+      location: us-east5
+    models:
+      - name: claude-opus-4-6
+  - name: my_bedrock
+    type: bedrock
+    url: "https://bedrock-mantle.us-east-1.api.aws"
+    # Bearer token auth — credentials_path is a file with the API key
+    credentials_path: bedrock_api_key.txt
+    models:
+      # use fully qualified Bedrock model IDs (e.g. anthropic.claude-opus-4-7,
+      # openai.gpt-5.4, deepseek.v3.1)
+      - name: anthropic.claude-opus-4-7
+  # - name: my_bedrock_iam
+  #   type: bedrock
+  #   url: "https://bedrock-mantle.us-east-1.api.aws"
+  #   # IAM auth — credentials_path is a directory with aws_access_key_id,
+  #   # aws_secret_access_key, and optionally role_arn files
+  #   credentials_path: /path/to/aws_creds_dir/
+  #   models:
+  #     - name: anthropic.claude-opus-4-7
   - name: instructlab
     type: openai
     url: "http://localhost:8000/v1"
@@ -43,13 +75,14 @@ llm_providers:
       - name: model-name
 ols_config:
   # max_workers: 1
+  # Product docs via Solr hybrid (OKP).  Omit solr_hybrid to disable.
+  solr_hybrid:
+    solr_http_base: "https://solr.example.com:8983"
+  # BYOK / local FAISS indexes (user-supplied content only).
   reference_content:
     indexes:
-      - product_docs_index_path: "./vector_db/ocp_product_docs/4.17"
-        product_docs_index_id: ocp-product-docs-4_17
       - product_docs_index_path: "./vector_db/user_application_docs/version_1"
         product_docs_index_id: user-application-docs-version_1
-    embeddings_model_path: "./embeddings_model"
   conversation_cache:
     type: memory
     memory:

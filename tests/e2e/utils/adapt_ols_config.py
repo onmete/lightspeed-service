@@ -11,8 +11,14 @@ import yaml
 from ols.constants import DEFAULT_CONFIGURATION_FILE
 from tests.e2e.utils import cluster as cluster_utils
 from tests.e2e.utils.data_collector_control import configure_exporter_for_e2e_tests
+from tests.e2e.utils.ols_installer import ensure_azure_entra_id_secret
 from tests.e2e.utils.retry import retry_until_timeout_or_success
 from tests.e2e.utils.wait_for_ols import wait_for_ols
+
+disconnected = os.getenv("DISCONNECTED", "")
+
+_OLS_APP_DEPLOYMENT_WAIT_ATTEMPTS = 60
+_OLS_APP_DEPLOYMENT_WAIT_INTERVAL_S = 10
 
 
 def apply_olsconfig(provider_list: list[str]) -> None:
@@ -27,11 +33,26 @@ def apply_olsconfig(provider_list: list[str]) -> None:
         ols_config_suffix = os.getenv("OLS_CONFIG_SUFFIX", "default")
         if ols_config_suffix != "default":
             crd_yml_name += f"_{ols_config_suffix}"
+        crd_yml_file = f"tests/config/operator_install/{crd_yml_name}.yaml"
         print(f"Applying olsconfig CR from {crd_yml_name}.yaml")
-        cluster_utils.run_oc(
-            ["apply", "-f", f"tests/config/operator_install/{crd_yml_name}.yaml"],
-            ignore_existing_resource=False,
-        )
+        if "rhoai_vllm_lseval" in crd_yml_file:
+            if not os.environ.get("KSVC_URL"):
+                raise RuntimeError(
+                    "KSVC_URL environment variable is not set; "
+                    "required for rhoai_vllm_lseval CR template"
+                )
+            with open(crd_yml_file, encoding="utf-8") as fh:
+                substituted = os.path.expandvars(fh.read())
+            cluster_utils.run_oc(
+                ["apply", "-f", "-"],
+                command=substituted,
+                ignore_existing_resource=False,
+            )
+        else:
+            cluster_utils.run_oc(
+                ["apply", "-f", crd_yml_file],
+                ignore_existing_resource=False,
+            )
     else:
         print("Applying evaluation olsconfig CR for multiple providers")
         cluster_utils.run_oc(
@@ -156,25 +177,18 @@ def wait_for_deployment() -> None:
     Ensures the lightspeed-app-server deployment is available and pods are running.
     """
     print("Waiting for OLS deployment to be available...")
-    retry_until_timeout_or_success(
+    if not retry_until_timeout_or_success(
         30,
         5,
-        lambda: cluster_utils.run_oc(
-            [
-                "get",
-                "deployment",
-                "lightspeed-app-server",
-                "--ignore-not-found",
-                "-o",
-                "name",
-            ]
-        ).stdout.strip()
-        == "deployment.apps/lightspeed-app-server",
+        lambda: cluster_utils.deployment_exists("lightspeed-app-server"),
         "Waiting for lightspeed-app-server deployment to be detected",
-    )
+    ):
+        raise RuntimeError(
+            "Timed out waiting for lightspeed-app-server Deployment to exist"
+        )
 
     print("Waiting for pods to be ready...")
-    cluster_utils.wait_for_running_pod()
+    cluster_utils.wait_for_running_pod(wait_http_ready=False)
 
 
 def setup_route() -> str:
@@ -201,21 +215,8 @@ def setup_route() -> str:
     return f"https://{url}"
 
 
-def adapt_ols_config() -> tuple[str, str, str]:  # pylint: disable=R0915
-    """Adapt OLS configuration for different providers dynamically.
-
-    Ensures RBAC, service accounts, and OLS route exist for test execution.
-    This function assumes the operator has already been scaled down during initial setup.
-
-    Returns:
-        tuple: (ols_url, token, metrics_token)
-    """
-    print("Adapting OLS configuration for provider switching")
-    provider_env = os.getenv("PROVIDER", "openai")
-    provider_list = provider_env.split() or ["openai"]
-    ols_image = os.getenv("OLS_IMAGE", "")
-    namespace = "openshift-lightspeed"
-
+def _scale_down_existing_app_server() -> None:
+    """Scale down existing app server deployment if present."""
     print("Checking for existing app server deployment...")
     try:
         cluster_utils.run_oc(
@@ -230,6 +231,10 @@ def adapt_ols_config() -> tuple[str, str, str]:  # pylint: disable=R0915
         print("Old app server scaled down")
     except Exception as e:
         print(f"No existing app server to scale down (this is OK): {e}")
+
+
+def _reconcile_olsconfig_with_operator(provider_list: list[str]) -> None:
+    """Scale up operator, apply OLSConfig CR, wait for reconciliation, then scale down."""
     # Scaling operator to 1 replica to allow finalizer to run for olsconfig
     cluster_utils.run_oc(
         [
@@ -239,8 +244,7 @@ def adapt_ols_config() -> tuple[str, str, str]:  # pylint: disable=R0915
             "1",
         ]
     )
-    # Wait for operator pod to be ready
-    retry_until_timeout_or_success(
+    if not retry_until_timeout_or_success(
         60,
         5,
         lambda: (
@@ -253,9 +257,14 @@ def adapt_ols_config() -> tuple[str, str, str]:  # pylint: disable=R0915
             for status in cluster_utils.get_container_ready_status(pods[0])
         ),
         "Waiting for operator to be ready",
-    )
+    ):
+        raise RuntimeError(
+            "Timed out waiting for lightspeed-operator-controller-manager pod to be ready"
+        )
     try:
-        cluster_utils.run_oc(["delete", "olsconfig", "cluster", "--ignore-not-found"])
+        cluster_utils.run_oc(
+            ["delete", "olsconfig", "cluster", "--ignore-not-found", "--wait"]
+        )
         print(" Old OLSConfig CR removed")
     except Exception as e:
         print(f"Could not delete old OLSConfig: {e}")
@@ -269,24 +278,17 @@ def adapt_ols_config() -> tuple[str, str, str]:  # pylint: disable=R0915
     print("Waiting for operator to reconcile OLSConfig CR (30 seconds)...")
     time.sleep(30)  # Let operator reconcile CR → deployment + configmap
 
-    # Verify reconciliation happened - check deployment exists AND has pods
     print("Verifying operator reconciliation completed...")
-    retry_until_timeout_or_success(
-        30,  # Give more time for operator to fully reconcile
-        3,
-        lambda: cluster_utils.run_oc(
-            [
-                "get",
-                "deployment",
-                "lightspeed-app-server",
-                "--ignore-not-found",
-                "-o",
-                "jsonpath={.status.replicas}",
-            ]
-        ).stdout.strip()
-        != "",
-        "Waiting for operator to create deployment with replicas",
-    )
+    if not retry_until_timeout_or_success(
+        _OLS_APP_DEPLOYMENT_WAIT_ATTEMPTS,
+        _OLS_APP_DEPLOYMENT_WAIT_INTERVAL_S,
+        lambda: cluster_utils.deployment_exists("lightspeed-app-server"),
+        "Waiting for operator to create lightspeed-app-server deployment",
+    ):
+        raise RuntimeError(
+            "Timed out waiting for lightspeed-app-server Deployment after OLSConfig "
+            "reconcile (includes image pull); check operator logs and OLSConfig status"
+        )
     cluster_utils.run_oc(
         [
             "scale",
@@ -296,34 +298,51 @@ def adapt_ols_config() -> tuple[str, str, str]:  # pylint: disable=R0915
         ]
     )
 
-    retry_until_timeout_or_success(
+    if not retry_until_timeout_or_success(
         30,
         3,
         lambda: not cluster_utils.get_pod_by_prefix(
             prefix="lightspeed-operator-controller-manager", fail_not_found=False
         ),
         "Waiting for operator to scale down",
-    )
+    ):
+        raise RuntimeError(
+            "Timed out waiting for lightspeed-operator-controller-manager pod to terminate"
+        )
     print("Operator scaled down")
 
-    # Scale down app server to apply e2e configurations
+
+def _apply_e2e_specific_config(ols_image: str) -> None:
+    """Scale down app server, update configmap and image, then scale back up."""
+    if not cluster_utils.deployment_exists("lightspeed-app-server"):
+        raise RuntimeError(
+            "lightspeed-app-server Deployment is missing; cannot apply e2e configuration"
+        )
     print("Scaling down app server to apply e2e configurations...")
     cluster_utils.run_oc(
         ["scale", "deployment/lightspeed-app-server", "--replicas", "0"]
     )
 
-    retry_until_timeout_or_success(
+    if not retry_until_timeout_or_success(
         30,
         3,
         lambda: not cluster_utils.get_pod_by_prefix(fail_not_found=False),
         "Waiting for app server pod to terminate",
-    )
+    ):
+        raise RuntimeError(
+            "Timed out waiting for lightspeed-app-server pods to terminate after scale to 0"
+        )
     print("App server scaled down")
 
-    # Update configmap with e2e-specific settings - FAIL FAST if this breaks
-    print("Updating configmap with e2e test settings...")
-    update_ols_configmap()
-    print(" Configmap updated successfully")
+    if not disconnected:
+        # Update configmap with e2e-specific settings - FAIL FAST if this breaks
+        print("Updating configmap with e2e test settings...")
+        update_ols_configmap()
+        print(" Configmap updated successfully")
+    else:
+        print(
+            "Disconnected mode: skipping configmap update, using existing configuration"
+        )
     # Apply test image
     if ols_image:
         print(f"Applying test image: {ols_image}")
@@ -357,6 +376,16 @@ def adapt_ols_config() -> tuple[str, str, str]:  # pylint: disable=R0915
     # Wait for deployment to be ready
     wait_for_deployment()
 
+
+def _setup_access_and_tokens(namespace: str) -> tuple[str, str]:
+    """Set up service accounts, RBAC, and return tokens.
+
+    Args:
+        namespace: The Kubernetes namespace for access configuration.
+
+    Returns:
+        tuple: (token, metrics_token)
+    """
     # Ensure service accounts exist
     try:
         setup_service_accounts(namespace)
@@ -371,24 +400,52 @@ def adapt_ols_config() -> tuple[str, str, str]:  # pylint: disable=R0915
     except Exception as e:
         print(f"Warning: Could not ensure pod-reader role/binding: {e}")
 
-    # Configure exporter for e2e tests with proper settings
-    try:
-        print("Configuring exporter for e2e tests...")
-        configure_exporter_for_e2e_tests(
-            interval_seconds=3600,  # 1 hour to prevent interference
-            ingress_env="stage",
-            log_level="DEBUG",
-            data_dir="/app-root/ols-user-data",
-        )
-        print("Exporter configured successfully")
-    except Exception as e:
-        print(f"Warning: Could not configure exporter: {e}")
-        print("Tests may experience interference from data collector")
+    if not disconnected:
+        # Configure exporter for e2e tests with proper settings
+        try:
+            print("Configuring exporter for e2e tests...")
+            configure_exporter_for_e2e_tests(
+                interval_seconds=3600,  # 1 hour to prevent interference
+                ingress_env="stage",
+                log_level="DEBUG",
+                data_dir="/app-root/ols-user-data",
+            )
+            print("Exporter configured successfully")
+        except Exception as e:
+            print(f"Warning: Could not configure exporter: {e}")
+            print("Tests may experience interference from data collector")
 
     # Fetch tokens for service accounts
     print("Fetching tokens for service accounts...")
     token = cluster_utils.get_token_for("test-user")
     metrics_token = cluster_utils.get_token_for("metrics-test-user")
+
+    return token, metrics_token
+
+
+def adapt_ols_config() -> tuple[str, str, str]:
+    """Adapt OLS configuration for different providers dynamically.
+
+    Ensures RBAC, service accounts, and OLS route exist for test execution.
+    This function assumes the operator has already been scaled down during initial setup.
+    Pytest usually runs ``ols_installer.create_secrets`` before this; we still ensure
+    Azure Entra ID secrets here so ``adapt`` is safe when invoked standalone.
+
+    Returns:
+        tuple: (ols_url, token, metrics_token)
+    """
+    print("Adapting OLS configuration for provider switching")
+    provider_env = os.getenv("PROVIDER", "openai")
+    provider_list = provider_env.split() or ["openai"]
+    ols_image = os.getenv("OLS_IMAGE", "")
+    namespace = "openshift-lightspeed"
+
+    _scale_down_existing_app_server()
+    if "azure_openai" in provider_list:
+        ensure_azure_entra_id_secret()
+    _reconcile_olsconfig_with_operator(provider_list)
+    _apply_e2e_specific_config(ols_image)
+    token, metrics_token = _setup_access_and_tokens(namespace)
 
     # Set up route and get URL
     ols_url = setup_route()

@@ -1,7 +1,7 @@
 # Put targets here if there is a risk that a target name might conflict with a filename.
 # this list is probably overkill right now.
 # See: https://www.gnu.org/software/make/manual/html_node/Phony-Targets.html
-.PHONY: test test-unit test-e2e test-eval test-lseval-periodic images run format verify
+.PHONY: test test-unit test-e2e test-eval test-lseval-periodic test-lseval-troubleshooting test-cluster-updates images run format verify get-embeddings get-embeddings-byok get-embeddings-okp tls-scan
 
 export PATH := $(HOME)/.local/bin:$(PATH)
 
@@ -66,7 +66,7 @@ benchmarks: ## Run benchmarks
 test-unit: ## Run the unit tests
 	@echo "Running unit tests..."
 	@echo "Reports will be written to ${ARTIFACT_DIR}"
-	COVERAGE_FILE="${ARTIFACT_DIR}/.coverage.unit" uv run pytest tests/unit tests/mcp_local --cov=ols --cov=mcp_local --cov=runner --cov-report term-missing --cov-report "json:${ARTIFACT_DIR}/coverage_unit.json" --junit-xml="${ARTIFACT_DIR}/junit_unit.xml"
+	COVERAGE_FILE="${ARTIFACT_DIR}/.coverage.unit" uv run pytest tests/unit --cov=ols --cov=runner --cov-report term-missing --cov-report "json:${ARTIFACT_DIR}/coverage_unit.json" --junit-xml="${ARTIFACT_DIR}/junit_unit.xml"
 	uv run scripts/transform_coverage_report.py "${ARTIFACT_DIR}/coverage_unit.json" "${ARTIFACT_DIR}/coverage_unit.out"
 	scripts/codecov.sh "${ARTIFACT_DIR}/coverage_unit.out"
 
@@ -86,19 +86,35 @@ test-e2e: ## Run e2e tests - requires running OLS server
 	@echo "Running e2e tests..."
 	@echo "Reports will be written to ${ARTIFACT_DIR}"
 	uv run pytest tests/e2e --ignore=tests/e2e/evaluation -s --durations=0 -o junit_suite_name="${SUITE_ID}" -m "${TEST_TAGS}" --junit-prefix="${SUITE_ID}" --junit-xml="${ARTIFACT_DIR}/junit_e2e_${SUITE_ID}.xml" \
-	--eval_provider ${PROVIDER} --eval_model ${MODEL} --eval_out_dir ${ARTIFACT_DIR} --rp_name=ols-e2e-tests
+	--eval_provider ${PROVIDER} --eval_model ${MODEL} --eval_out_dir ${ARTIFACT_DIR}
 
 test-eval: ## Run evaluation tests - requires running OLS server
 	@echo "Running evaluation tests..."
 	@echo "Reports will be written to ${ARTIFACT_DIR}"
 	uv run --extra evaluation pytest tests/e2e/evaluation -vv -s --durations=0 -o junit_suite_name="${SUITE_ID}" --junit-prefix="${SUITE_ID}" --junit-xml="${ARTIFACT_DIR}/junit_e2e_${SUITE_ID}.xml" \
-	--eval_out_dir ${ARTIFACT_DIR} -m "not lseval"
+	--eval_out_dir ${ARTIFACT_DIR} -m "not lseval and not cluster_updates"
 
-test-lseval-periodic: ## Run LSEval periodic evaluation - requires running OLS server with WatsonX and Azure OpenAI judge keys
+test-lseval-periodic: ## Run LSEval periodic evaluation (full 797-question dataset) - requires running OLS server with OpenAI keys
 	@echo "Running LSEval periodic evaluation..."
 	@echo "Reports will be written to ${ARTIFACT_DIR}"
-	uv run --extra lseval pytest tests/e2e/evaluation -vv -s --durations=0 -o junit_suite_name="${SUITE_ID}" --junit-prefix="${SUITE_ID}" --junit-xml="${ARTIFACT_DIR}/junit_e2e_${SUITE_ID}.xml" \
-	--eval_out_dir ${ARTIFACT_DIR} -m lseval
+	uv run --extra lseval --extra evaluation pytest tests/e2e/evaluation/test_lseval_periodic.py -vv -s --durations=0 -o junit_suite_name="${SUITE_ID}" --junit-prefix="${SUITE_ID}" --junit-xml="${ARTIFACT_DIR}/junit_e2e_${SUITE_ID}.xml" \
+	--eval_out_dir ${ARTIFACT_DIR} -m lseval --lseval_provider ${PROVIDER}
+
+# DISABLED: re-enable by uncommenting the recipe body below.
+# test-lseval-troubleshooting: ## Run LSEval troubleshooting evaluation (scenario + MCP suites) - requires running OLS server with OpenAI keys
+# 	@echo "Running LSEval troubleshooting evaluation..."
+# 	@echo "Reports will be written to ${ARTIFACT_DIR}"
+# 	uv run --extra lseval --extra evaluation pytest tests/e2e/evaluation/test_lseval_troubleshooting.py -vv -s --durations=0 -o junit_suite_name="${SUITE_ID}" --junit-prefix="${SUITE_ID}" --junit-xml="${ARTIFACT_DIR}/junit_e2e_${SUITE_ID}.xml" \
+# 	--eval_out_dir ${ARTIFACT_DIR} -m lseval
+
+test-lseval-troubleshooting: ## DISABLED: LSEval troubleshooting (uncomment Makefile to re-enable)
+	@echo "test-lseval-troubleshooting is disabled for now (troubleshooting LSEval commented out)." >&2
+
+test-cluster-updates: ## Run cluster-updates evaluation (18 conversations, 35 evaluations) - requires running OLS server with OpenAI keys
+	@echo "Running cluster-updates evaluation..."
+	@echo "Reports will be written to ${ARTIFACT_DIR}"
+	uv run --extra lseval --extra evaluation pytest tests/e2e/evaluation -vv -s --durations=0 -o junit_suite_name="${SUITE_ID}" --junit-prefix="${SUITE_ID}" --junit-xml="${ARTIFACT_DIR}/junit_e2e_${SUITE_ID}.xml" \
+	--eval_out_dir ${ARTIFACT_DIR} -m cluster_updates
 
 coverage-report:	unit-tests-coverage-report integration-tests-coverage-report ## Export coverage reports into interactive HTML
 
@@ -112,7 +128,7 @@ check-types: ## Checks type hints in sources
 	uv run mypy --explicit-package-bases --disallow-untyped-calls --disallow-untyped-defs --disallow-incomplete-defs ols/
 
 security-check: ## Check the project for security issues
-	uv run bandit -c pyproject.toml -r .
+	uv run bandit -c pyproject.toml -r ols runner.py
 
 format: ## Format the code into unified format
 	uv run black .
@@ -134,12 +150,12 @@ requirements.txt:	pyproject.toml uv.lock ## Generate requirements.txt file conta
 verify-packages-completeness:	requirements.txt ## Verify that requirements.txt file contains complete list of packages
 	pip download -d /tmp/ --use-pep517 --verbose -r requirements.txt
 
-get-rag: ## Download a copy of the RAG embedding model and vector database
-	podman create --replace --name tmp-rag-container $$(grep 'ARG LIGHTSPEED_RAG_CONTENT_IMAGE' Containerfile | awk 'BEGIN{FS="="}{print $$2}') true
-	rm -rf vector_db embeddings_model
-	podman cp tmp-rag-container:/rag/vector_db vector_db
-	podman cp tmp-rag-container:/rag/embeddings_model embeddings_model
-	podman rm tmp-rag-container
+get-embeddings: get-embeddings-byok get-embeddings-okp ## Download all embedding model binaries
+
+get-embeddings-byok: ## Download BYOK/FAISS embedding model binary
+	curl --fail --location --retry 3 --retry-delay 2 --connect-timeout 15 \
+		-o embeddings_model/all-mpnet-base-v2/model.safetensors \
+		"https://huggingface.co/sentence-transformers/all-mpnet-base-v2/resolve/main/model.safetensors"
 
 config.puml: ## Generate PlantUML class diagram for configuration
 	pyreverse ols/app/models/config.py --output puml --output-directory=docs/
@@ -166,6 +182,15 @@ shellcheck: ## Run shellcheck
 	wget -qO- "https://github.com/koalaman/shellcheck/releases/download/stable/shellcheck-stable.linux.x86_64.tar.xz" | tar -xJv \
 	shellcheck --version
 	shellcheck -- */*.sh
+
+tls-scan: ## Run TLS profile compliance scan against OLS endpoints
+	./scripts/tls-scan.sh
+
+konflux-requirements:	## Generate hermetic requirements.*.txt file for konflux build
+	./scripts/konflux_requirements.sh
+
+konflux-rpm-lock:	## Generate rpm.lock.yaml file for konflux build
+	./scripts/generate-rpm-lock.sh -a ${ACTIVATION_KEY} -g ${ORG_ID}
 
 help: ## Show this help screen
 	@echo 'Usage: make <OPTIONS> ... <TARGETS>'

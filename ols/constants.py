@@ -5,25 +5,32 @@ import ssl
 from enum import StrEnum
 
 # providers
-PROVIDER_BAM = "bam"
 PROVIDER_OPENAI = "openai"
 PROVIDER_AZURE_OPENAI = "azure_openai"
 PROVIDER_WATSONX = "watsonx"
 PROVIDER_RHOAI_VLLM = "rhoai_vllm"
 PROVIDER_RHELAI_VLLM = "rhelai_vllm"
 PROVIDER_FAKE = "fake_provider"
+PROVIDER_GOOGLE_VERTEX_ANTHROPIC = "google_vertex_anthropic"
+PROVIDER_GOOGLE_VERTEX = "google_vertex"
+PROVIDER_BEDROCK = "bedrock"
 SUPPORTED_PROVIDER_TYPES = frozenset(
     {
-        PROVIDER_BAM,
         PROVIDER_OPENAI,
         PROVIDER_AZURE_OPENAI,
         PROVIDER_WATSONX,
         PROVIDER_RHOAI_VLLM,
         PROVIDER_RHELAI_VLLM,
         PROVIDER_FAKE,
+        PROVIDER_GOOGLE_VERTEX_ANTHROPIC,
+        PROVIDER_GOOGLE_VERTEX,
+        PROVIDER_BEDROCK,
     }
 )
 DEFAULT_AZURE_API_VERSION = "2024-02-15-preview"
+
+EMBEDDINGS_MODEL_BYOK_SUBDIR = "all-mpnet-base-v2"
+# EMBEDDINGS_MODEL_OKP_SUBDIR = "granite-embedding-30m-english"
 
 
 # models
@@ -34,6 +41,13 @@ class ModelFamily(StrEnum):
     GRANITE = "granite"
 
 
+class QueryMode(StrEnum):
+    """Query modes that control which system prompt is used."""
+
+    ASK = "ask"
+    TROUBLESHOOTING = "troubleshooting"
+
+
 class GenericLLMParameters:
     """Generic LLM parameters that can be mapped into LLM provider-specific parameters."""
 
@@ -42,10 +56,6 @@ class GenericLLMParameters:
     TOP_K = "top_k"
     TOP_P = "top_p"
     TEMPERATURE = "temperature"
-
-
-# Max Iteration for tool calling
-MAX_ITERATIONS = 5
 
 
 # Token related constants
@@ -62,6 +72,13 @@ DEFAULT_CONTEXT_WINDOW_SIZE = 128000
 # It should be in reasonable proportion to context window limit; otherwise unnecessary
 # truncation will happen. If not set, default value will be used.
 DEFAULT_MAX_TOKENS_FOR_RESPONSE = 4096
+DEFAULT_MAX_ITERATIONS = 5
+DEFAULT_MAX_ITERATIONS_TROUBLESHOOTING = 15
+
+MAX_ITERATIONS_BY_MODE: dict["QueryMode", int] = {
+    QueryMode.ASK: DEFAULT_MAX_ITERATIONS,
+    QueryMode.TROUBLESHOOTING: DEFAULT_MAX_ITERATIONS_TROUBLESHOOTING,
+}
 
 
 # Tokenizer model to generate tokens (for an approximated token calculation)
@@ -70,11 +87,16 @@ DEFAULT_TOKENIZER_MODEL = "cl100k_base"
 # Example: 1.05 means we increase by 5%.
 TOKEN_BUFFER_WEIGHT = 1.1
 
-# Tool output token limits
-# Maximum tokens for a single tool output before truncation
-DEFAULT_MAX_TOKENS_PER_TOOL_OUTPUT = 8000
-# Total tokens reserved for all tool outputs (only used when MCP servers configured)
-DEFAULT_MAX_TOKENS_FOR_TOOLS = 32000
+# Fraction of context window reserved for tool outputs when MCP servers or
+# Solr hybrid search is configured. Computed as int(context_window_size * ratio) at startup.
+DEFAULT_TOOL_BUDGET_RATIO = 0.5
+TOOL_BUDGET_RATIO_MIN = 0.1
+TOOL_BUDGET_RATIO_MAX = 0.6
+
+# Max fraction of remaining tool token budget usable in one tool-calling round.
+DEFAULT_TOOL_ROUND_CAP_FRACTION = 0.6
+TOOL_ROUND_CAP_FRACTION_MIN = 0.3
+TOOL_ROUND_CAP_FRACTION_MAX = 0.8
 
 
 # RAG related constants
@@ -101,6 +123,10 @@ RAG_CONTENT_LIMIT = 5
 # Range: 0 to 1
 RAG_SIMILARITY_CUTOFF = 0.3
 
+# Solr hybrid (OKP ``portal-rag`` / ``hybrid-search``) query embeddings must match the
+# vectors stored in the index (same default as solr-experiment / solr_vector_io).
+SOLR_HYBRID_EMBEDDING_MODEL_ID = "ibm-granite/granite-embedding-30m-english"
+
 
 # cache constants
 CACHE_TYPE_MEMORY = "memory"
@@ -114,7 +140,7 @@ POSTGRES_CACHE_MAX_ENTRIES = 1000
 
 # look at https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLMODE
 # for all possible options
-POSTGRES_CACHE_SSL_MODE = "prefer"
+POSTGRES_CACHE_SSL_MODE = "require"
 
 # look at https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-GSSENCMODE
 # for all possible options
@@ -173,6 +199,12 @@ AZURE_TENANT_ID_FILENAME = "tenant_id"
 # Default name of file containing client secret to Azure OpenAI
 AZURE_CLIENT_SECRET_FILENAME = "client_secret"  # noqa: S105  # nosec: B105
 
+BEDROCK_ACCESS_KEY_ID_FILENAME = "aws_access_key_id"
+BEDROCK_SECRET_ACCESS_KEY_FILENAME = (
+    "aws_secret_access_key"  # noqa: S105  # nosec: B105
+)
+BEDROCK_ROLE_ARN_FILENAME = "role_arn"
+
 # Selectors for fields from configuration structure
 CREDENTIALS_PATH_SELECTOR = "credentials_path"
 
@@ -185,8 +217,18 @@ CERTIFICATE_STORAGE_FILENAME = "ols.pem"
 # Default SSL version used by FastAPI REST API
 DEFAULT_SSL_VERSION = ssl.PROTOCOL_TLS_SERVER
 
-# Default SSL ciphers used by FastAPI REST API
-DEFAULT_SSL_CIPHERS = "TLSv1"
+# Default SSL ciphers used by FastAPI REST API (matches IntermediateType profile
+# plus FIPS-compliant CBC ciphers for HAProxy reencrypt route compatibility)
+DEFAULT_SSL_CIPHERS = (
+    "TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256, "
+    "ECDHE-ECDSA-AES128-GCM-SHA256, ECDHE-RSA-AES128-GCM-SHA256, "
+    "ECDHE-ECDSA-AES256-GCM-SHA384, ECDHE-RSA-AES256-GCM-SHA384, "
+    "ECDHE-ECDSA-CHACHA20-POLY1305, ECDHE-RSA-CHACHA20-POLY1305, "
+    "DHE-RSA-AES128-GCM-SHA256, DHE-RSA-AES256-GCM-SHA384, "
+    "ECDHE-ECDSA-AES128-SHA256, ECDHE-RSA-AES128-SHA256, "
+    "ECDHE-ECDSA-AES256-SHA384, ECDHE-RSA-AES256-SHA384, "
+    "DHE-RSA-AES128-SHA256, DHE-RSA-AES256-SHA256"
+)
 
 # Default authentication module
 DEFAULT_AUTHENTICATION_MODULE = "k8s"
@@ -207,6 +249,9 @@ CONFIGURATION_DUMP_FILE_NAME = "configuration.json"
 # configuration file
 CONFIGURATION_FILE_NAME_ENV_VARIABLE = "OLS_CONFIG_FILE"
 
+# Service name used in OpenAPI specification
+SERVICE_NAME = "OpenShift LightSpeed"
+
 # Response streaming media types
 MEDIA_TYPE_TEXT = "text/plain"
 MEDIA_TYPE_JSON = "application/json"
@@ -220,6 +265,13 @@ CLUSTER_QUOTA_LIMITER = "cluster_limiter"
 
 # MCP transport default timeout
 MCP_HTTP_TRANSPORT_DEFAULT_TIMEOUT = 5  # in seconds
+
+# Offloading defaults
+DEFAULT_OFFLOAD_STORAGE_PATH = "/tmp/ols-offloaded"  # noqa: S108
+OFFLOAD_MAX_SEARCH_MATCHES = 50
+OFFLOAD_MAX_READ_LINES = 500
+OFFLOAD_MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
+OFFLOAD_REGEX_TIMEOUT_SECONDS = 5
 
 # MCP authorization header placeholders
 MCP_KUBERNETES_PLACEHOLDER = "kubernetes"

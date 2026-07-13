@@ -1,10 +1,10 @@
 ---
 llm_providers:
   - name: p1
-    type: bam
+    type: openai
     url: "https://url1"
     credentials_path: tests/config/secret/apitoken
-    bam_config:
+    openai_config:
       url: "http://localhost:1234"
       credentials_path: tests/config/secret/apitoken
     models:
@@ -14,8 +14,7 @@ llm_providers:
         context_window_size: 8000
         parameters:
           max_tokens_for_response: 2000
-          max_tokens_for_tools: 2000
-          max_tokens_per_tool_output: 500
+          tool_budget_ratio: 0.25
 ols_config:
   max_workers: 1
   reference_content:

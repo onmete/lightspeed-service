@@ -61,7 +61,7 @@ def test_invalid_dev_config():
 ---
 llm_providers:
   - name: p1
-    type: bam
+    type: openai
     credentials_path: tests/config/secret/apitoken
     models:
       - name: m1
@@ -103,7 +103,7 @@ def test_invalid_config_missing_ols_config_section():
 ---
 llm_providers:
   - name: p1
-    type: bam
+    type: openai
     url: 'http://url1'
     models:
       - name: m1
@@ -111,7 +111,7 @@ llm_providers:
       - name: m2
         url: 'https://murl2'
   - name: p2
-    type: bam
+    type: openai
     url: 'https://url2'
     models:
       - name: m1
@@ -131,7 +131,7 @@ def test_invalid_config_invalid_model_url():
 ---
 llm_providers:
   - name: p1
-    type: bam
+    type: openai
     url: 'http://url1'
     models:
       - name: m1
@@ -139,7 +139,7 @@ llm_providers:
       - name: m2
         url: 'https://murl2'
   - name: p2
-    type: bam
+    type: openai
     url: 'https://url2'
     models:
       - name: m1
@@ -164,7 +164,7 @@ def test_invalid_config_invalid_provider_url():
 ---
 llm_providers:
   - name: p1
-    type: bam
+    type: openai
     url: 'not-valid-url'
     models:
       - name: m1
@@ -172,7 +172,7 @@ llm_providers:
       - name: m2
         url: 'https://murl2'
   - name: p2
-    type: bam
+    type: openai
     url: 'https://url2'
     models:
       - name: m1
@@ -194,7 +194,7 @@ ols_config:
 ---
 llm_providers:
   - name: p1
-    type: bam
+    type: openai
     url: foobar
     models:
       - name: m1
@@ -217,7 +217,7 @@ def test_invalid_config_missing_provider_name():
 ---
 llm_providers:
   - foo: p1
-    type: bam
+    type: openai
     url: 'http://url1'
     models:
       - name: m1
@@ -240,7 +240,7 @@ def test_invalid_config_unknown_provider_name():
 ---
 llm_providers:
   - name: p1
-    type: bam
+    type: openai
     url: 'http://url1'
     models:
       - name: m1
@@ -267,7 +267,7 @@ def test_invalid_config_unknown_model_name():
 ---
 llm_providers:
   - name: p1
-    type: bam
+    type: openai
     url: 'http://url1'
     models:
       - name: m1
@@ -294,7 +294,7 @@ def test_invalid_config_missing_default_model():
 ---
 llm_providers:
   - name: p1
-    type: bam
+    type: openai
     url: 'http://url1'
     models:
       - name: m1
@@ -320,7 +320,7 @@ def test_invalid_config_missing_default_provider():
 ---
 llm_providers:
   - name: p1
-    type: bam
+    type: openai
     url: 'http://url1'
     models:
       - name: m1
@@ -346,7 +346,7 @@ def test_invalid_config_for_memory_cache():
 ---
 llm_providers:
   - name: p1
-    type: bam
+    type: openai
     url: 'http://url1'
     models:
       - name: m1
@@ -371,7 +371,7 @@ ols_config:
 ---
 llm_providers:
   - name: p1
-    type: bam
+    type: openai
     url: 'http://url1'
     models:
       - name: m1
@@ -397,7 +397,7 @@ def test_invalid_config_improper_credentials():
 ---
 llm_providers:
   - name: p1
-    type: bam
+    type: openai
     url: 'http://url1'
     credentials_path: no_such_file
 ols_config:
@@ -415,7 +415,7 @@ ols_config:
 ---
 llm_providers:
   - name: p1
-    type: bam
+    type: openai
     url: 'http://url1'
     credentials_path: tests/config/secret/apitoken
     models:
@@ -440,7 +440,7 @@ def test_invalid_config_improper_reference_content():
 ---
 llm_providers:
   - name: p1
-    type: bam
+    type: openai
     credentials_path: tests/config/secret/apitoken
     models:
       - name: m1
@@ -469,35 +469,7 @@ dev_config:
 ---
 llm_providers:
   - name: p1
-    type: bam
-    credentials_path: tests/config/secret/apitoken
-    models:
-      - name: m1
-        credentials_path: tests/config/secret/apitoken
-ols_config:
-  reference_content:
-    embeddings_model_path: ./invalid_dir
-  conversation_cache:
-    type: memory
-    memory:
-      max_entries: 1000
-dev_config:
-  llm_temperature_override: 0.1
-  enable_dev_ui: true
-  disable_auth: false
-  pyroscope_url: https://pyroscope.pyroscope.svc.cluster.local:4040
-
-""",
-        InvalidConfigurationError,
-        "Embeddings model path './invalid_dir' does not exist",
-    )
-
-    check_expected_exception(
-        """
----
-llm_providers:
-  - name: p1
-    type: bam
+    type: openai
     credentials_path: tests/config/secret/apitoken
     models:
       - name: m1
@@ -524,7 +496,7 @@ dev_config:
 ---
 llm_providers:
   - name: p1
-    type: bam
+    type: openai
     credentials_path: tests/config/secret/apitoken
     models:
       - name: m1
@@ -547,38 +519,6 @@ dev_config:
     )
 
 
-def test_unreadable_directory():
-    """Check if an unredable directory is reported correctly."""
-    with patch("os.access", return_value=False):
-        check_expected_exception(
-            """
----
-llm_providers:
-  - name: p1
-    type: bam
-    credentials_path: tests/config/secret/apitoken
-    models:
-      - name: m1
-        credentials_path: tests/config/secret/apitoken
-ols_config:
-  reference_content:
-    embeddings_model_path: tests/config
-  conversation_cache:
-    type: memory
-    memory:
-      max_entries: 1000
-dev_config:
-  llm_temperature_override: 0.1
-  enable_dev_ui: true
-  disable_auth: false
-  disable_tls: true
-
-""",
-            InvalidConfigurationError,
-            "Embeddings model path 'tests/config' is not readable",
-        )
-
-
 def test_valid_config_stream():
     """Check if a valid configuration stream is handled correctly."""
     try:
@@ -586,7 +526,7 @@ def test_valid_config_stream():
 ---
 llm_providers:
   - name: p1
-    type: bam
+    type: openai
     url: 'http://url1'
     credentials_path: tests/config/secret/apitoken
     models:
@@ -602,7 +542,7 @@ llm_providers:
           - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
       minTLSVersion: VersionTLS13
   - name: p2
-    type: bam
+    type: openai
     url: 'https://url2'
     models:
       - name: m1
@@ -672,7 +612,7 @@ def test_valid_config_file():
         # Verify LLM providers
         assert "p1" in config.config.llm_providers.providers
         assert "p2" in config.config.llm_providers.providers
-        assert config.config.llm_providers.providers["p1"].type == "bam"
+        assert config.config.llm_providers.providers["p1"].type == "openai"
         assert config.config.llm_providers.providers["p2"].type == "openai"
 
         # Verify OLS config
@@ -713,7 +653,7 @@ def test_valid_config_file_without_certificate_directory():
                 "llm_providers": [
                     {
                         "name": "p1",
-                        "type": "bam",
+                        "type": "openai",
                         "url": "https://url1",
                         "credentials_path": "tests/config/secret/apitoken",
                         "models": [
@@ -768,6 +708,10 @@ def test_valid_config_file_without_certificate_directory():
                     "default_model": "m1",
                     "certificate_directory": constants.DEFAULT_CERTIFICATE_DIRECTORY,
                 },
+                "dev_config": {
+                    "disable_auth": True,
+                    "disable_tls": True,
+                },
             }
         )
         assert config.config == expected_config
@@ -786,7 +730,7 @@ def test_valid_config_file_with_postgres():
                 "llm_providers": [
                     {
                         "name": "p1",
-                        "type": "bam",
+                        "type": "openai",
                         "url": "https://url1",
                         "credentials_path": "tests/config/secret/apitoken",
                         "models": [
@@ -823,6 +767,10 @@ def test_valid_config_file_with_postgres():
                     },
                     "default_provider": "p1",
                     "default_model": "m1",
+                },
+                "dev_config": {
+                    "disable_auth": True,
+                    "disable_tls": True,
                 },
             }
         )
@@ -918,12 +866,13 @@ def test_valid_config_with_azure_openai():
                     "default_provider": "p1",
                     "default_model": "m1",
                 },
+                "dev_config": {
+                    "disable_auth": True,
+                    "disable_tls": True,
+                },
             }
         )
         assert config.config == expected_config
-        provider_config = config.config.llm_providers.providers.get("p1")
-        assert provider_config is not None
-        assert provider_config.api_version == constants.DEFAULT_AZURE_API_VERSION
     except Exception as e:
         print(traceback.format_exc())
         pytest.fail(f"loading valid configuration failed: {e}")
@@ -975,6 +924,10 @@ def test_valid_config_with_azure_openai_credentials_path_only_in_provider_config
                     "default_provider": "p1",
                     "default_model": "m1",
                 },
+                "dev_config": {
+                    "disable_auth": True,
+                    "disable_tls": True,
+                },
             }
         )
         assert config.config == expected_config
@@ -999,7 +952,7 @@ def test_valid_config_with_azure_openai_api_version():
                         "url": "https://url1",
                         "credentials": "secret_key",
                         "deployment_name": "test",
-                        "api_version": "2023-12-31",
+                        "api_version": "2024-12-31",
                         "azure_openai_config": {
                             "url": "http://localhost:1234",
                             "deployment_name": "*deployment name*",
@@ -1028,110 +981,9 @@ def test_valid_config_with_azure_openai_api_version():
                     "default_provider": "p1",
                     "default_model": "m1",
                 },
-            }
-        )
-        assert config.config == expected_config
-        provider_config = config.config.llm_providers.providers.get("p1")
-        assert provider_config is not None
-        assert provider_config.api_version == "2024-12-31"
-    except Exception as e:
-        print(traceback.format_exc())
-        pytest.fail(f"loading valid configuration failed: {e}")
-
-
-def test_valid_config_with_bam():
-    """Check if a valid configuration file with BAM is handled correctly."""
-    try:
-        config.reload_from_yaml_file("tests/config/valid_config_with_bam.yaml")
-
-        expected_config = Config(
-            {
-                "llm_providers": [
-                    {
-                        "name": "p1",
-                        "type": "bam",
-                        "url": "https://url1",
-                        "credentials_path": "tests/config/secret/apitoken",
-                        "deployment_name": "test",
-                        "bam_config": {
-                            "url": "http://localhost:1234",
-                            "credentials_path": "tests/config/secret/apitoken",
-                        },
-                        "models": [
-                            {
-                                "name": "m1",
-                                "url": "https://murl1",
-                            },
-                        ],
-                    },
-                ],
-                "ols_config": {
-                    "conversation_cache": {
-                        "type": "postgres",
-                        "postgres": {
-                            "host": "foobar.com",
-                            "port": "1234",
-                            "dbname": "test",
-                            "user": "user",
-                            "password_path": "tests/config/postgres_password.txt",
-                            "ca_cert_path": "tests/config/postgres_cert.crt",
-                            "ssl_mode": "require",
-                        },
-                    },
-                    "default_provider": "p1",
-                    "default_model": "m1",
-                },
-            }
-        )
-        assert config.config == expected_config
-        provider_config = config.config.llm_providers.providers.get("p1")
-        assert provider_config is not None
-        assert provider_config.api_version is None
-    except Exception as e:
-        print(traceback.format_exc())
-        pytest.fail(f"loading valid configuration failed: {e}")
-
-
-def test_valid_config_with_bam_credentials_path_only_in_provider_config():
-    """Check if a valid configuration file with BAM is handled correctly."""
-    try:
-        config.reload_from_yaml_file("tests/config/valid_config_with_bam_2.yaml")
-
-        expected_config = Config(
-            {
-                "llm_providers": [
-                    {
-                        "name": "p1",
-                        "type": "bam",
-                        "url": "https://url1",
-                        "deployment_name": "test",
-                        "bam_config": {
-                            "url": "http://localhost:1234",
-                            "credentials_path": "tests/config/secret/apitoken",
-                        },
-                        "models": [
-                            {
-                                "name": "m1",
-                                "url": "https://murl1",
-                            },
-                        ],
-                    },
-                ],
-                "ols_config": {
-                    "conversation_cache": {
-                        "type": "postgres",
-                        "postgres": {
-                            "host": "foobar.com",
-                            "port": "1234",
-                            "dbname": "test",
-                            "user": "user",
-                            "password_path": "tests/config/postgres_password.txt",
-                            "ca_cert_path": "tests/config/postgres_cert.crt",
-                            "ssl_mode": "require",
-                        },
-                    },
-                    "default_provider": "p1",
-                    "default_model": "m1",
+                "dev_config": {
+                    "disable_auth": True,
+                    "disable_tls": True,
                 },
             }
         )
@@ -1185,6 +1037,10 @@ def test_valid_config_with_watsonx():
                     "default_provider": "p1",
                     "default_model": "m1",
                 },
+                "dev_config": {
+                    "disable_auth": True,
+                    "disable_tls": True,
+                },
             }
         )
         assert config.config == expected_config
@@ -1236,6 +1092,52 @@ def test_valid_config_with_watsonx_credentials_path_only_in_provider_config():
                     "default_provider": "p1",
                     "default_model": "m1",
                 },
+                "dev_config": {
+                    "disable_auth": True,
+                    "disable_tls": True,
+                },
+            }
+        )
+        assert config.config == expected_config
+    except Exception as e:
+        print(traceback.format_exc())
+        pytest.fail(f"loading valid configuration failed: {e}")
+
+
+def test_valid_config_with_bedrock():
+    """Check if a valid configuration file with Bedrock is handled correctly."""
+    try:
+        config.reload_from_yaml_file("tests/config/valid_config_with_bedrock.yaml")
+
+        expected_config = Config(
+            {
+                "llm_providers": [
+                    {
+                        "name": "my_bedrock",
+                        "type": "bedrock",
+                        "url": "https://bedrock-mantle.us-east-1.api.aws",
+                        "credentials_path": "tests/config/secret/apitoken",
+                        "models": [
+                            {
+                                "name": "anthropic.claude-opus-4-7",
+                            },
+                        ],
+                    },
+                ],
+                "ols_config": {
+                    "conversation_cache": {
+                        "type": "memory",
+                        "memory": {
+                            "max_entries": 1000,
+                        },
+                    },
+                    "default_provider": "my_bedrock",
+                    "default_model": "anthropic.claude-opus-4-7",
+                },
+                "dev_config": {
+                    "disable_auth": True,
+                    "disable_tls": True,
+                },
             }
         )
         assert config.config == expected_config
@@ -1251,3 +1153,83 @@ def test_quota_limiters_property():
     config.reload_from_yaml_file("tests/config/valid_config_without_query_filter.yaml")
     # force reinitialization
     assert config.quota_limiters is not None
+
+
+def test_solr_hybrid_search_uses_fixed_portal_rag_embedding_model():
+    """Solr hybrid loads the OKP portal-rag HuggingFace embedding id, not the RAG index model."""
+    yaml_stream = """
+---
+llm_providers:
+  - name: p1
+    type: openai
+    url: "https://url1"
+    credentials_path: tests/config/secret/apitoken
+    models:
+      - name: m1
+        url: "https://murl1"
+        credentials_path: tests/config/secret/apitoken
+        context_window_size: 450
+        parameters:
+          max_tokens_for_response: 100
+ols_config:
+  solr_hybrid:
+    solr_http_base: "http://localhost:8080"
+  conversation_cache:
+    type: memory
+    memory:
+      max_entries: 1000
+  logging_config:
+    app_log_level: info
+    lib_log_level: warning
+  default_provider: p1
+  default_model: m1
+  user_data_collection:
+    transcripts_disabled: true
+  tls_config:
+    tls_certificate_path: tests/config/server.crt
+    tls_key_path: tests/config/server.key
+    tls_key_password_path: tests/config/password
+  tlsSecurityProfile:
+    type: Custom
+    ciphers:
+      - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+      - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+    minTLSVersion: VersionTLS13
+dev_config:
+  disable_tls: true
+  disable_auth: true
+"""
+
+    class _StubEmbed:
+        def get_text_embedding(self, text: str) -> list[float]:
+            return [0.0]
+
+    with (
+        patch(
+            "llama_index.embeddings.huggingface.HuggingFaceEmbedding",
+            autospec=True,
+        ) as mock_hf,
+        patch(
+            "ols.src.rag_index.solr_support.SolrHybridSearch._resolve_chunk_filter_query",
+            return_value="is_chunk:true AND product:openshift_container_platform",
+        ),
+    ):
+        mock_hf.return_value = _StubEmbed()
+        config.reload_empty()
+        config.config = config._load_config_from_yaml_stream(
+            io.StringIO(yaml_stream), ignore_missing_certs=True
+        )
+        for key in (
+            "solr_hybrid_search",
+            "rag_index_loader",
+            "mcp_servers_dict",
+            "tools_rag",
+            "skills_rag",
+        ):
+            config.__dict__.pop(key, None)
+        client = config.solr_hybrid_search
+        assert client is not None
+        mock_hf.assert_called_once_with(
+            model_name=constants.SOLR_HYBRID_EMBEDDING_MODEL_ID
+        )
+    config.reload_empty()

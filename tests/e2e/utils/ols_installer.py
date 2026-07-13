@@ -2,6 +2,7 @@
 
 import os
 import subprocess
+import time
 
 import yaml
 
@@ -15,6 +16,60 @@ OC_COMMAND_RETRY_COUNT = 120
 OC_COMMAND_RETRY_DELAY = 5
 
 disconnected = os.getenv("DISCONNECTED", "")
+
+
+def _app_server_deployment_exists() -> bool:
+    """Return True if the OLS API Deployment exists (``oc -o name`` shape varies by version)."""
+    name_line = cluster_utils.run_oc(
+        [
+            "get",
+            "deployment",
+            "lightspeed-app-server",
+            "--ignore-not-found",
+            "-o",
+            "name",
+        ]
+    ).stdout.strip()
+    return name_line in (
+        "deployment.apps/lightspeed-app-server",
+        "deployment/lightspeed-app-server",
+    )
+
+
+def _wait_for_operator_controller_ready() -> None:
+    """Wait until the operator manager pod exists and all containers are ready."""
+    r = retry_until_timeout_or_success(
+        60,
+        5,
+        lambda: (
+            pods := cluster_utils.get_pod_by_prefix(
+                prefix="lightspeed-operator-controller-manager", fail_not_found=False
+            )
+        )
+        and all(
+            status == "true"
+            for status in cluster_utils.get_container_ready_status(pods[0])
+        ),
+        "Waiting for operator controller to be ready",
+    )
+    if not r:
+        raise Exception(
+            "Timed out waiting for operator controller manager to become ready"
+        )
+
+
+def _dump_ols_install_debug() -> None:
+    """Print cluster state to logs when install waits fail (Konflux / Azure debugging)."""
+    for label, args in (
+        ("OLSConfig", ["get", "olsconfig", "cluster", "-o", "yaml"]),
+        ("deployments", ["get", "deployments", "-n", "openshift-lightspeed"]),
+        ("CSV", ["get", "csv", "-n", "openshift-lightspeed", "-o", "wide"]),
+    ):
+        try:
+            print(f"--- {label} (debug) ---")
+            print(cluster_utils.run_oc(args).stdout)
+        except Exception as e:
+            print(f"Could not get {label}: {e}")
 
 
 def create_and_config_sas() -> tuple[str, str]:
@@ -96,15 +151,11 @@ def update_ols_config() -> None:
         old_rag_config = olsconfig["ols_config"]["reference_content"]
         product_docs_index_id = ""
         product_docs_index_path = ""
-        embeddings_model_path = ""
-        if "embeddings_model_path" in old_rag_config:
-            embeddings_model_path = old_rag_config["embeddings_model_path"]
         if "product_docs_index_id" in old_rag_config:
             product_docs_index_id = old_rag_config["product_docs_index_id"]
         if "product_docs_index_path" in old_rag_config:
             product_docs_index_path = old_rag_config["product_docs_index_path"]
         olsconfig["ols_config"]["reference_content"] = {
-            "embeddings_model_path": embeddings_model_path,
             "indexes": [
                 {
                     "product_docs_index_id": product_docs_index_id,
@@ -167,8 +218,50 @@ def replace_ols_image(ols_image: str) -> None:
     )
 
 
+_AZURE_ENTRA_ENV_KEYS: tuple[str, ...] = (
+    "AZUREOPENAI_ENTRA_ID_TENANT_ID",
+    "AZUREOPENAI_ENTRA_ID_CLIENT_ID",
+    "AZUREOPENAI_ENTRA_ID_CLIENT_SECRET",
+)
+
+
+def ensure_azure_entra_id_secret() -> None:
+    """Create openshift-lightspeed/azure-entra-id when Entra credentials are available."""
+    values = {k: os.getenv(k) for k in _AZURE_ENTRA_ENV_KEYS}
+    missing = [k for k in _AZURE_ENTRA_ENV_KEYS if not values[k]]
+    if missing:
+        print(
+            "Skipping azure-entra-id secret creation (unset or empty): "
+            f"{', '.join(missing)}. "
+            "Azure OpenAI via Entra will not work until these CI/Vault/Prow env vars "
+            "are set."
+        )
+        return
+
+    tenant_id = values["AZUREOPENAI_ENTRA_ID_TENANT_ID"]
+    client_id = values["AZUREOPENAI_ENTRA_ID_CLIENT_ID"]
+    client_secret = values["AZUREOPENAI_ENTRA_ID_CLIENT_SECRET"]
+
+    print("Ensuring azure-entra-id secret exists...")
+    cluster_utils.run_oc(
+        [
+            "create",
+            "secret",
+            "generic",
+            "azure-entra-id",
+            f"--from-literal=tenant_id={tenant_id}",
+            f"--from-literal=client_id={client_id}",
+            f"--from-literal=client_secret={client_secret}",
+        ],
+        ignore_existing_resource=True,
+    )
+
+
 def create_secrets(provider_name: str, creds: str, provider_size: int) -> None:
-    """Create secrets for models.
+    """Create Kubernetes secrets needed for an LLM provider (API creds).
+
+    Azure Entra ID secret ``azure-entra-id`` is ensured separately when the provider
+    list includes ``azure_openai`` (see ``install_ols`` and ``adapt_ols_config``).
 
     Args:
         provider_name (str): the name of the provider.
@@ -315,20 +408,8 @@ def install_ols() -> tuple[str, str, str]:  # pylint: disable=R0915, R0912  # no
     for i, prov in enumerate(provider_list):
         create_secrets(prov, creds_list[i], len(provider_list))
 
-    if provider == "azure_openai":
-        # create extra secrets with Entra ID
-        cluster_utils.run_oc(
-            [
-                "create",
-                "secret",
-                "generic",
-                "azure-entra-id",
-                f"--from-literal=tenant_id={os.environ['AZUREOPENAI_ENTRA_ID_TENANT_ID']}",
-                f"--from-literal=client_id={os.environ['AZUREOPENAI_ENTRA_ID_CLIENT_ID']}",
-                f"--from-literal=client_secret={os.environ['AZUREOPENAI_ENTRA_ID_CLIENT_SECRET']}",
-            ],
-            ignore_existing_resource=True,
-        )
+    if "azure_openai" in provider_list:
+        ensure_azure_entra_id_secret()
 
     # create the olsconfig operand
     try:
@@ -337,6 +418,7 @@ def install_ols() -> tuple[str, str, str]:  # pylint: disable=R0915, R0912  # no
                 "delete",
                 "olsconfig",
                 "cluster",
+                "--wait",
             ],
         )
     except subprocess.CalledProcessError:
@@ -354,9 +436,26 @@ def install_ols() -> tuple[str, str, str]:  # pylint: disable=R0915, R0912  # no
             crd_yml_file = f"tests/config/operator_install/{crd_yml_name}.yaml"
 
         print(f"CRD path: {crd_yml_file}.")
-        cluster_utils.run_oc(
-            ["create", "-f", crd_yml_file], ignore_existing_resource=True
-        )
+
+        if "rhoai_vllm_lseval" in crd_yml_file:
+            print("Running envsubst on CR YAML (rhoai_vllm_lseval template)...")
+            if not os.environ.get("KSVC_URL"):
+                raise RuntimeError(
+                    "KSVC_URL environment variable is not set; "
+                    "required for rhoai_vllm_lseval CR template"
+                )
+            with open(crd_yml_file, encoding="utf-8") as fh:
+                raw = fh.read()
+            substituted = os.path.expandvars(raw)
+            cluster_utils.run_oc(
+                ["create", "-f", "-"],
+                command=substituted,
+                ignore_existing_resource=True,
+            )
+        else:
+            cluster_utils.run_oc(
+                ["create", "-f", crd_yml_file], ignore_existing_resource=True
+            )
 
     except subprocess.CalledProcessError as e:
         csv = cluster_utils.run_oc(
@@ -374,27 +473,24 @@ def install_ols() -> tuple[str, str, str]:  # pylint: disable=R0915, R0912  # no
             "1",
         ]
     )
+    _wait_for_operator_controller_ready()
+
+    print(
+        "Waiting for operator to reconcile OLSConfig before checking API deployment..."
+    )
+    time.sleep(30)
 
     # wait for the ols api server deployment to be created
     r = retry_until_timeout_or_success(
         OC_COMMAND_RETRY_COUNT,
         OC_COMMAND_RETRY_DELAY,
-        lambda: cluster_utils.run_oc(
-            [
-                "get",
-                "deployment",
-                "lightspeed-app-server",
-                "--ignore-not-found",
-                "-o",
-                "name",
-            ]
-        ).stdout
-        == "deployment.apps/lightspeed-app-server\n",
+        _app_server_deployment_exists,
         "Waiting for OLS API server deployment to be created",
     )
     if not r:
         msg = "Timed out waiting for OLS deployment to be created"
         print(msg)
+        _dump_ols_install_debug()
         raise Exception(msg)
     print("OLS deployment created")
 
@@ -445,7 +541,7 @@ def install_ols() -> tuple[str, str, str]:  # pylint: disable=R0915, R0912  # no
     )
     print("Deployment updated, waiting for new pod to be ready")
     # Wait for the pod to start being created and then wait for it to start running.
-    cluster_utils.wait_for_running_pod()
+    cluster_utils.wait_for_running_pod(wait_http_ready=False)
 
     print("-" * 50)
     print("OLS pod seems to be ready")

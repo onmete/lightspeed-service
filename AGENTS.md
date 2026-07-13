@@ -13,9 +13,15 @@ OpenShift LightSpeed (OLS) is an AI-powered assistant service for OpenShift buil
 ## Code Standards
 
 ### Python Version & Dependencies
-- **Python 3.11/3.12** - Target version py311 in all code
+- **Python 3.12** - Target version py312 in all code
 - **uv** - Package manager (not pip/poetry/pdm)
 - **Dependencies** - Always check existing imports before adding new ones
+- **Konflux hermetic build** - The Konflux build installs from `requirements.hashes.source.txt` and `requirements.hashes.wheel.txt`, NOT from `uv.lock`. When adding new dependencies to `pyproject.toml`:
+  1. **Do NOT run `make konflux-requirements`** — full regeneration causes version drift that breaks hermeto prefetch
+  2. Instead, surgically append hash entries for new packages: `uv pip compile <pkg-file> --refresh --generate-hashes --python-version 3.12 --no-deps --no-annotate`
+  3. Put packages in `requirements.hashes.source.txt` (PyPI source) unless they match RHOAI index versions exactly
+  4. Check `requirements-build.txt` for build deps (e.g. `uv-build`, `hatchling`) — bump if a new package needs a newer version
+  5. Check transitive deps — if a new package pulls in deps not already in either hash file, add those too
 
 ### Code Quality Tools
 - **Ruff** - Linting (Google docstring convention)
@@ -88,6 +94,10 @@ make check-types    # MyPy type checking only
 make security-check # Bandit security scan
 ```
 
+## Specs
+
+All specifications live in `.ai/spec/`. Start with `.ai/spec/README.md` for project overview, reading order, and structure guide.
+
 ## Detailed References
 
 You MUST read the relevant file before working in a specific area — don't skip these:
@@ -126,6 +136,32 @@ Do not cross module or layer boundaries, even when it is the shorter path.
 
 ### Keep changes scoped
 Do not refactor, rename, or reformat outside the direct path of the task. Unrelated improvements belong in a separate PR.
+
+## Git and PR Workflow
+
+### Commit Messages
+- Start with the Jira ticket reference: `OLS-XXXX description`
+- Keep the first line under 72 characters
+- Use imperative mood
+
+### Pull Requests
+This repo uses a **fork-based workflow**:
+
+1. **Push to your fork**, not to `origin` (openshift/lightspeed-service)
+2. **Create the PR** against `origin/main` using your fork's branch:
+   ```bash
+   git push <your-fork-remote> <branch>
+   gh pr create --repo openshift/lightspeed-service --head <your-github-user>:<branch> --base main
+   ```
+3. **PR title** must start with the Jira reference: `OLS-XXXX description`
+4. **Squash commits** before pushing -- one logical commit per PR unless the PR explicitly tracks multiple independent changes
+
+### Branch Completion
+When finishing a development branch:
+1. Remove any process artifacts (design docs, plans in `docs/superpowers/`)
+2. Squash commits with the Jira-prefixed message
+3. Push to the contributor's fork remote (not `origin`)
+4. Create the PR against `origin/main` using `--head <user>:<branch>`
 
 ## Maintaining This Guide
 

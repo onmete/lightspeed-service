@@ -4,8 +4,10 @@
 import logging
 from typing import Any, Optional
 
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+
 from ols.app.models.config import ReferenceContent
-from ols.constants import RAG_CONTENT_LIMIT
+from ols.constants import EMBEDDINGS_MODEL_BYOK_SUBDIR, RAG_CONTENT_LIMIT
 
 logger = logging.getLogger(__name__)
 
@@ -132,25 +134,14 @@ class IndexLoader:
         elif self._index_config.indexes is None or len(self._index_config.indexes) == 0:
             logger.warning("Indexes are not set in the config for reference content.")
         else:
-
-            self._embed_model_path = self._index_config.embeddings_model_path
             self._embed_model = self._get_embed_model()
             self._load_index()
 
-    def _get_embed_model(self) -> Any:
-        """Get embed model according to configuration."""
-        if self._embed_model_path is not None:
-            # pylint: disable=C0415
-            from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-
-            logger.debug(
-                "Loading embedding model info from path %s", self._embed_model_path
-            )
-            return HuggingFaceEmbedding(model_name=self._embed_model_path)
-
-        logger.warning("Embedding model path is not set.")
-        logger.warning("Embedding model is set to default")
-        return "local:sentence-transformers/all-mpnet-base-v2"
+    @staticmethod
+    def _get_embed_model() -> HuggingFaceEmbedding:
+        """Load the bundled BYOK embedding model."""
+        logger.debug("Loading embedding model: %s", EMBEDDINGS_MODEL_BYOK_SUBDIR)
+        return HuggingFaceEmbedding(model_name=EMBEDDINGS_MODEL_BYOK_SUBDIR)
 
     def _load_index(self) -> None:
         """Load vector index."""

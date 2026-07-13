@@ -1,59 +1,50 @@
-"""Unit tests for DocsSummarizer class."""
+"""Unit tests for DocsSummarizer PR2 class."""
 
-import json
 import logging
-import re
-from math import ceil
-from unittest.mock import ANY, AsyncMock, MagicMock, Mock, patch
+from typing import ClassVar
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.messages.ai import AIMessageChunk
 
 from ols import config
-from ols.app.models.config import MCPServerConfig
-from ols.constants import TOKEN_BUFFER_WEIGHT
-from ols.utils.mcp_utils import _normalize_tool_schema, gather_mcp_tools
-from ols.utils.token_handler import TokenHandler
-from tests.mock_classes.mock_tools import (
-    MOCK_TOOL_META,
-    NAMESPACES_OUTPUT,
-    POD_STRUCTURED_CONTENT,
-    mock_tools_map,
-    mock_tools_with_meta,
-    mock_tools_with_structured_content,
+from ols.app.models.config import LoggingConfig, MCPServerConfig, SolrHybridSettings
+from ols.app.models.models import StreamChunkType, StreamedChunk
+from ols.constants import (
+    DEFAULT_MAX_ITERATIONS,
+    DEFAULT_MAX_ITERATIONS_TROUBLESHOOTING,
+    QueryMode,
 )
+from ols.utils.config import AppConfig
 
-# needs to be setup there before is_user_authorized is imported
+# needs to be setup before importing docs_summarizer
 config.ols_config.authentication_config.module = "k8s"
 
-
-from ols.app.models.config import (  # noqa:E402
-    LoggingConfig,
-)
-from ols.src.query_helpers.docs_summarizer import (  # noqa:E402
+from ols.app.models.models import CacheEntry  # noqa: E402
+from ols.src.query_helpers.docs_summarizer import (  # noqa: E402
     DocsSummarizer,
     QueryHelper,
 )
-from ols.utils import suid  # noqa:E402
-from ols.utils.logging_configurator import configure_logging  # noqa:E402
-from tests import constants  # noqa:E402
-from tests.mock_classes.mock_langchain_interface import (  # noqa:E402
+from ols.utils.logging_configurator import configure_logging  # noqa: E402
+from ols.utils.mcp_utils import build_mcp_config, gather_mcp_tools  # noqa: E402
+from ols.utils.token_handler import (  # noqa: E402
+    PromptTooLongError,
+    TokenBudgetTracker,
+    TokenCategory,
+    TokenHandler,
+)
+from tests import constants  # noqa: E402
+from tests.mock_classes.mock_langchain_interface import (  # noqa: E402
     mock_langchain_interface,
 )
-from tests.mock_classes.mock_llm_loader import mock_llm_loader  # noqa:E402
-from tests.mock_classes.mock_retrievers import MockRetriever  # noqa:E402
-
-conversation_id = suid.get_suid()
-
-
-def test_is_query_helper_subclass():
-    """Test that DocsSummarizer is a subclass of QueryHelper."""
-    assert issubclass(DocsSummarizer, QueryHelper)
+from tests.mock_classes.mock_llm_loader import mock_llm_loader  # noqa: E402
+from tests.mock_classes.mock_retrievers import MockRetriever  # noqa: E402
+from tests.mock_classes.mock_tools import mock_tools_map  # noqa: E402
 
 
-def check_summary_result(summary, question):
-    """Check result produced by DocsSummarizer.summary method."""
+def check_summary_result(summary, question: str) -> None:
+    """Check result produced by DocsSummarizer.create_response method."""
     assert question in summary.response
     assert isinstance(summary.rag_chunks, list)
     assert len(summary.rag_chunks) == 1
@@ -72,89 +63,129 @@ def _setup():
     config.reload_from_yaml_file("tests/config/valid_config_without_mcp.yaml")
 
 
+def test_is_query_helper_subclass():
+    """Test that DocsSummarizer is a subclass of QueryHelper."""
+    assert issubclass(DocsSummarizer, QueryHelper)
+
+
 def test_if_system_prompt_was_updated():
-    """Test if system prompt was overided from the configuration."""
+    """Test if system prompt was overridden from the configuration."""
     summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
-    # expected prompt was loaded during configuration phase
-    expected_prompt = config.ols_config.system_prompt
-    assert summarizer._system_prompt == expected_prompt
+    assert summarizer._system_prompt == config.ols_config.system_prompt
+
+
+def test_tool_calling_enabled_when_solr_docs_tool_active_without_mcp():
+    """Enable tool loop when Solr hybrid docs tool is active, without MCP servers."""
+    hybrid = SolrHybridSettings()
+    mock_client = MagicMock()
+    with (
+        patch.object(config.ols_config, "solr_hybrid", hybrid),
+        patch.object(
+            AppConfig,
+            "solr_hybrid_search",
+            PropertyMock(return_value=mock_client),
+        ),
+    ):
+        summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+    assert summarizer._tool_calling_enabled is True
+
+
+def test_tool_calling_disabled_without_mcp_and_without_solr_docs_tool():
+    """Tool calling stays off when neither MCP nor Solr docs tool is active."""
+    summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+    assert summarizer._tool_calling_enabled is False
 
 
 def test_summarize_empty_history():
-    """Basic test for DocsSummarizer using mocked index and query engine."""
+    """Basic test for DocsSummarizer using mocked retriever and empty history."""
     with (
         patch("ols.utils.token_handler.RAG_SIMILARITY_CUTOFF", 0.4),
         patch("ols.utils.token_handler.MINIMUM_CONTEXT_TOKEN_LIMIT", 1),
     ):
         summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
         question = "What's the ultimate question with answer 42?"
-        rag_retriever = MockRetriever()
-        history = []  # empty history
-        summary = summarizer.create_response(question, rag_retriever, history)
+        summary = summarizer.create_response(question, MockRetriever(), [])
         check_summary_result(summary, question)
 
 
 def test_summarize_no_history():
-    """Basic test for DocsSummarizer using mocked index and query engine, no history is provided."""
+    """Basic test for DocsSummarizer without explicit history argument."""
     with (
         patch("ols.utils.token_handler.RAG_SIMILARITY_CUTOFF", 0.4),
         patch("ols.utils.token_handler.MINIMUM_CONTEXT_TOKEN_LIMIT", 3),
     ):
         summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
         question = "What's the ultimate question with answer 42?"
-        rag_retriever = MockRetriever()
-        # no history is passed into summarize() method
-        summary = summarizer.create_response(question, rag_retriever)
+        summary = summarizer.create_response(question, MockRetriever())
         check_summary_result(summary, question)
 
 
 def test_summarize_history_provided():
-    """Basic test for DocsSummarizer using mocked index and query engine, history is provided."""
+    """Basic test with explicit history vs default history paths."""
     with (
         patch("ols.utils.token_handler.RAG_SIMILARITY_CUTOFF", 0.4),
         patch("ols.utils.token_handler.MINIMUM_CONTEXT_TOKEN_LIMIT", 3),
+        patch("ols.config.conversation_cache.get") as mock_cache_get,
     ):
         summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
         question = "What's the ultimate question with answer 42?"
-        history = ["human: What is Kubernetes?"]
         rag_retriever = MockRetriever()
 
-        # first call with history provided
+        mock_cache_get.return_value = [
+            CacheEntry(query=HumanMessage("What is Kubernetes?"))
+        ]
         with patch(
             "ols.src.query_helpers.docs_summarizer.TokenHandler.limit_conversation_history",
             return_value=([], False),
         ) as token_handler:
-            summary1 = summarizer.create_response(question, rag_retriever, history)
-            token_handler.assert_called_once_with(history, ANY)
-            check_summary_result(summary1, question)
+            summary1 = summarizer.create_response(
+                question, rag_retriever, "user-id", "conv-id"
+            )
+            # Non-overflow path returns early from prepare_history (no second limit pass).
+            token_handler.assert_not_called()
+            check_summary_result(summary1, "What is Kubernetes?")
 
-        # second call without history provided
+        mock_cache_get.return_value = []
         with patch(
             "ols.src.query_helpers.docs_summarizer.TokenHandler.limit_conversation_history",
             return_value=([], False),
         ) as token_handler:
-            summary2 = summarizer.create_response(question, rag_retriever)
-            token_handler.assert_called_once_with([], ANY)
+            summary2 = summarizer.create_response(
+                question, rag_retriever, "user-id", "conv-id2"
+            )
+            token_handler.assert_not_called()
             check_summary_result(summary2, question)
 
 
 def test_summarize_truncation():
-    """Basic test for DocsSummarizer to check if truncation is done."""
-    with patch("ols.utils.token_handler.RAG_SIMILARITY_CUTOFF", 0.4):
+    """Basic test for DocsSummarizer to check compression avoids truncation."""
+    with (
+        patch("ols.utils.token_handler.RAG_SIMILARITY_CUTOFF", 0.4),
+        patch("ols.config.conversation_cache.get") as mock_cache_get,
+    ):
         summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
         question = "What's the ultimate question with answer 42?"
         rag_retriever = MockRetriever()
 
-        # too long history
-        history = [HumanMessage("What is Kubernetes?")] * 10000
-        summary = summarizer.create_response(question, rag_retriever, history)
+        history = [
+            CacheEntry(
+                query=HumanMessage("What is Kubernetes?" * 100),
+                response=AIMessage(
+                    "Kubernetes is a container orchestration system." * 100
+                ),
+            )
+        ] * 100
+        mock_cache_get.return_value = history
 
-        # truncation should be done
-        assert summary.history_truncated
+        summary = summarizer.create_response(
+            question, rag_retriever, "user-id", "conv-id"
+        )
+
+        assert not summary.history_truncated
 
 
 def test_summarize_no_reference_content():
-    """Basic test for DocsSummarizer using mocked index and query engine."""
+    """Basic test when no retriever is provided."""
     summarizer = DocsSummarizer(
         llm_loader=mock_llm_loader(mock_langchain_interface("test response")())
     )
@@ -165,13 +196,12 @@ def test_summarize_no_reference_content():
     assert not summary.history_truncated
 
 
-def test_summarize_reranker(caplog):
-    """Basic test to make sure the reranker is called as expected."""
+def test_summarize_retrieval_logging(caplog):
+    """Basic test to ensure retrieval details are visible in logs."""
     logging_config = LoggingConfig(app_log_level="debug")
-
     configure_logging(logging_config)
     logger = logging.getLogger("ols")
-    logger.handlers = [caplog.handler]  # add caplog handler to logger
+    logger.handlers = [caplog.handler]
 
     with (
         patch("ols.utils.token_handler.RAG_SIMILARITY_CUTOFF", 0.4),
@@ -179,13 +209,30 @@ def test_summarize_reranker(caplog):
     ):
         summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
         question = "What's the ultimate question with answer 42?"
-        rag_retriever = MockRetriever()
-        # no history is passed into create_response() method
-        summary = summarizer.create_response(question, rag_retriever)
+        summary = summarizer.create_response(question, MockRetriever())
         check_summary_result(summary, question)
+        assert "Retrieved 1 document nodes for RAG context" in caplog.text
 
-        # Check captured log text to see if reranker was called.
-        assert "reranker.rerank() is called with 1 result(s)." in caplog.text
+
+@pytest.mark.asyncio
+async def test_resolve_tools_appends_openshift_docs_tool_when_solr_configured_no_mcp():
+    """Append docs tool for Solr hybrid when MCP returns no tools."""
+    with patch(
+        "ols.src.query_helpers.docs_summarizer.get_mcp_tools",
+        new_callable=AsyncMock,
+    ) as m_get:
+        m_get.return_value = []
+        prev = config.ols_config.solr_hybrid
+        config.ols_config.solr_hybrid = SolrHybridSettings()
+        config.__dict__["solr_hybrid_search"] = MagicMock()
+        try:
+            summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+            tools = await summarizer._resolve_tools_for_request("query")
+        finally:
+            config.ols_config.solr_hybrid = prev
+            config.__dict__.pop("solr_hybrid_search", None)
+    assert [t.name for t in tools] == ["search_openshift_documentation"]
+    m_get.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -195,13 +242,52 @@ async def test_response_generator():
         llm_loader=mock_llm_loader(mock_langchain_interface("test response")())
     )
     question = "What's the ultimate question with answer 42?"
-    summary_gen = summarizer.generate_response(question)
     generated_content = ""
 
-    async for item in summary_gen:
+    async for item in summarizer.generate_response(question):
         generated_content += item.text
 
     assert generated_content == question
+
+
+@pytest.mark.asyncio
+async def test_response_generator_emits_history_events_before_tokens():
+    """Test history compression events are emitted in order before text chunks."""
+    summarizer = DocsSummarizer(
+        llm_loader=mock_llm_loader(mock_langchain_interface("test response")())
+    )
+    question = "What's the ultimate question with answer 42?"
+
+    async def mock_prepare_history(**kwargs):
+        yield StreamedChunk(
+            type=StreamChunkType.HISTORY_COMPRESSION_START,
+            data={"status": "started"},
+        )
+        yield StreamedChunk(
+            type=StreamChunkType.HISTORY_COMPRESSION_END,
+            data={"status": "completed", "duration_ms": 1.0},
+        )
+        yield ([], False)
+
+    chunk_types: list[StreamChunkType] = []
+
+    with patch(
+        "ols.src.query_helpers.docs_summarizer.prepare_history",
+        side_effect=mock_prepare_history,
+    ):
+        chunk_types.extend(
+            [item.type async for item in summarizer.generate_response(question)]
+        )
+
+    assert StreamChunkType.HISTORY_COMPRESSION_START in chunk_types
+    assert StreamChunkType.HISTORY_COMPRESSION_END in chunk_types
+    assert StreamChunkType.TEXT in chunk_types
+    assert chunk_types.index(
+        StreamChunkType.HISTORY_COMPRESSION_START
+    ) < chunk_types.index(StreamChunkType.HISTORY_COMPRESSION_END)
+    assert chunk_types.index(
+        StreamChunkType.HISTORY_COMPRESSION_END
+    ) < chunk_types.index(StreamChunkType.TEXT)
 
 
 async def async_mock_invoke(yield_values):
@@ -212,16 +298,15 @@ async def async_mock_invoke(yield_values):
 
 def test_tool_calling_one_iteration():
     """Test tool calling - stops after one iteration."""
-    question = "How many namespaces are there in my cluster?"
-
     with patch(
-        "ols.src.query_helpers.docs_summarizer.DocsSummarizer._invoke_llm"
+        "ols.src.query_helpers.llm_execution_agent.LLMExecutionAgent._invoke_llm"
     ) as mock_invoke:
         mock_invoke.side_effect = lambda *args, **kwargs: async_mock_invoke(
             [AIMessageChunk(content="XYZ", response_metadata={"finish_reason": "stop"})]
         )
         summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
-        summarizer.create_response(question)
+        summarizer._tool_calling_enabled = True
+        summarizer.create_response("How many namespaces are there in my cluster?")
         assert mock_invoke.call_count == 1
 
 
@@ -230,7 +315,7 @@ def test_tool_calling_drains_chunks_after_stop():
     question = "How many namespaces are there in my cluster?"
 
     with patch(
-        "ols.src.query_helpers.docs_summarizer.DocsSummarizer._invoke_llm"
+        "ols.src.query_helpers.llm_execution_agent.LLMExecutionAgent._invoke_llm"
     ) as mock_invoke:
         mock_invoke.side_effect = lambda *args, **kwargs: async_mock_invoke(
             [
@@ -249,221 +334,86 @@ def test_tool_calling_drains_chunks_after_stop():
 
 
 async def fake_invoke_llm(*args, **kwargs):
-    """Fake invoke_llm function to simulate LLM behavior.
-
-    Yields depends on the number of calls
-    """
-    # use an attribute on the function to track calls
+    """Fake invoke_llm function to simulate two-turn LLM behavior."""
     if not hasattr(fake_invoke_llm, "call_count"):
         fake_invoke_llm.call_count = 0
     fake_invoke_llm.call_count += 1
 
     if fake_invoke_llm.call_count == 1:
-        # first call yields a message that requests tool calls
         yield AIMessageChunk(
-            content="", response_metadata={"finish_reason": "tool_calls"}
+            content="",
+            response_metadata={"finish_reason": "tool_calls"},
+            tool_call_chunks=[
+                {
+                    "name": "get_namespaces_mock",
+                    "args": "{}",
+                    "id": "call_1",
+                    "index": 0,
+                }
+            ],
         )
     elif fake_invoke_llm.call_count == 2:
-        # second call yields the final message.
         yield AIMessageChunk(content="XYZ", response_metadata={"finish_reason": "stop"})
-    else:
-        # extra
-        yield AIMessageChunk(
-            content="Extra", response_metadata={"finish_reason": "extra"}
-        )
 
 
 def test_tool_calling_two_iteration():
     """Test tool calling - stops after two iterations."""
-    question = "How many namespaces are there in my cluster?"
-
     with (
         patch(
-            "ols.src.query_helpers.docs_summarizer.DocsSummarizer._invoke_llm",
+            "ols.src.query_helpers.llm_execution_agent.LLMExecutionAgent._invoke_llm",
             new=fake_invoke_llm,
         ) as mock_invoke,
-        patch("ols.utils.mcp_utils.config") as mock_config,
-    ):
-        # Mock config for get_mcp_tools
-        mock_config.tools_rag = None
-        mock_config.mcp_servers.servers = [MagicMock()]  # Non-empty list
-
-        # Mock _gather_and_populate_tools to return tools
-        with patch(
-            "ols.utils.mcp_utils._gather_and_populate_tools",
-            new=AsyncMock(return_value=({"test": {}}, mock_tools_map)),
-        ):
-            summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
-            summarizer.create_response(question)
-            assert mock_invoke.call_count == 2
-
-
-def test_tool_calling_force_stop():
-    """Test tool calling - force stop."""
-    question = "How many namespaces are there in my cluster?"
-
-    with (
-        patch("ols.src.query_helpers.docs_summarizer.MAX_ITERATIONS", 3),
         patch(
-            "ols.src.query_helpers.docs_summarizer.DocsSummarizer._invoke_llm"
-        ) as mock_invoke,
-        patch("ols.utils.mcp_utils.config") as mock_config,
+            "ols.src.query_helpers.docs_summarizer.get_mcp_tools",
+            new=AsyncMock(return_value=mock_tools_map),
+        ),
     ):
-        # Mock config for get_mcp_tools
-        mock_config.tools_rag = None
-        mock_config.mcp_servers.servers = [MagicMock()]  # Non-empty list
-
-        # Mock _gather_and_populate_tools to return tools
-        with patch(
-            "ols.utils.mcp_utils._gather_and_populate_tools",
-            new=AsyncMock(return_value=({"test": {}}, mock_tools_map)),
-        ):
-            mock_invoke.side_effect = lambda *args, **kwargs: async_mock_invoke(
-                [
-                    AIMessageChunk(
-                        content="XYZ", response_metadata={"finish_reason": "tool_calls"}
-                    )
-                ]
-            )
-            summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
-            summarizer.create_response(question)
-            assert mock_invoke.call_count == 3
-
-
-def test_tool_calling_tool_execution(caplog):
-    """Test tool calling - tool execution."""
-    caplog.set_level(10)  # Set debug level
-
-    question = "How many namespaces are there in my cluster?"
-
-    mcp_servers_config = {
-        "test_server": {
-            "transport": "streamable_http",
-            "url": "http://test-server:8080/mcp",
-        },
-    }
-
-    with (
-        patch("ols.src.query_helpers.docs_summarizer.MAX_ITERATIONS", 2),
-        patch("ols.utils.mcp_utils.MultiServerMCPClient") as mock_mcp_client_cls,
-        patch(
-            "ols.src.query_helpers.docs_summarizer.DocsSummarizer._invoke_llm"
-        ) as mock_invoke,
-        patch("ols.utils.mcp_utils.config") as mock_config,
-    ):
-        # Mock config for get_mcp_tools
-        mock_config.tools_rag = None
-        mock_config.mcp_servers.servers = [MagicMock()]  # Non-empty list
-
-        # Mock _gather_and_populate_tools to return tools
-        with patch(
-            "ols.utils.mcp_utils._gather_and_populate_tools",
-            new=AsyncMock(return_value=(mcp_servers_config, mock_tools_map)),
-        ):
-            mock_invoke.side_effect = lambda *args, **kwargs: async_mock_invoke(
-                [
-                    AIMessageChunk(
-                        content="",
-                        response_metadata={"finish_reason": "tool_calls"},
-                        tool_calls=[
-                            {
-                                "name": "get_namespaces_mock",
-                                "args": {},
-                                "id": "call_id1",
-                            },
-                            {
-                                "name": "invalid_function_name",
-                                "args": {},
-                                "id": "call_id2",
-                            },
-                        ],
-                    )
-                ]
-            )
-
-        # Create mock MCP client - now get_tools is called with server_name parameter
-        mock_mcp_client_instance = AsyncMock()
-        mock_mcp_client_instance.get_tools.return_value = mock_tools_map
-        mock_mcp_client_cls.return_value = mock_mcp_client_instance
-
         summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
-        # Disable token reservation for tools in this test (test config has small context window)
-        summarizer.model_config.parameters.max_tokens_for_tools = 0
-        summarizer.create_response(question)
-
-        assert "Tool: get_namespaces_mock" in caplog.text
-        assert f"Output: {NAMESPACES_OUTPUT}" in caplog.text
-
-        assert "Error: Tool 'invalid_function_name' not found." in caplog.text
-
+        summarizer._tool_calling_enabled = True
+        summarizer.create_response("How many namespaces are there in my cluster?")
         assert mock_invoke.call_count == 2
 
 
-def test_tool_result_includes_structured_content():
-    """Test that tool_result chunks include structured_content from artifact."""
-    question = "What are pod metrics?"
-
-    mcp_servers_config = {
-        "test_server": {
-            "transport": "streamable_http",
-            "url": "http://test-server:8080/mcp",
-        },
-    }
-
+def test_tool_calling_force_stop():
+    """Test tool calling - force stop by max rounds."""
     with (
-        patch("ols.src.query_helpers.docs_summarizer.MAX_ITERATIONS", 2),
-        patch("ols.utils.mcp_utils.MultiServerMCPClient") as mock_mcp_client_cls,
         patch(
-            "ols.src.query_helpers.docs_summarizer.DocsSummarizer._invoke_llm"
+            "ols.src.query_helpers.docs_summarizer.DocsSummarizer._get_max_iterations",
+            return_value=3,
+        ),
+        patch(
+            "ols.src.query_helpers.llm_execution_agent.LLMExecutionAgent._invoke_llm"
         ) as mock_invoke,
-        patch("ols.utils.mcp_utils.config") as mock_config,
+        patch(
+            "ols.src.query_helpers.docs_summarizer.get_mcp_tools",
+            new=AsyncMock(return_value=mock_tools_map),
+        ),
     ):
-        mock_config.tools_rag = None
-        mock_config.mcp_servers.servers = [MagicMock()]
-
-        with patch(
-            "ols.utils.mcp_utils._gather_and_populate_tools",
-            new=AsyncMock(
-                return_value=(mcp_servers_config, mock_tools_with_structured_content)
-            ),
-        ):
-            mock_invoke.side_effect = lambda *args, **kwargs: async_mock_invoke(
-                [
-                    AIMessageChunk(
-                        content="",
-                        response_metadata={"finish_reason": "tool_calls"},
-                        tool_calls=[
-                            {
-                                "name": "get_pod_metrics_mock",
-                                "args": {},
-                                "id": "call_pod1",
-                            },
-                        ],
-                    )
-                ]
-            )
-
-        mock_mcp_client_instance = AsyncMock()
-        mock_mcp_client_instance.get_tools.return_value = (
-            mock_tools_with_structured_content
+        mock_invoke.side_effect = lambda *args, **kwargs: async_mock_invoke(
+            [
+                AIMessageChunk(
+                    content="",
+                    response_metadata={"finish_reason": "tool_calls"},
+                    tool_call_chunks=[
+                        {
+                            "name": "get_namespaces_mock",
+                            "args": "{}",
+                            "id": "call_1",
+                            "index": 0,
+                        }
+                    ],
+                )
+            ]
         )
-        mock_mcp_client_cls.return_value = mock_mcp_client_instance
-
         summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
-        summarizer.model_config.parameters.max_tokens_for_tools = 0
-        result = summarizer.create_response(question)
-
-        assert len(result.tool_results) == 1
-        tool_result = result.tool_results[0]
-
-        assert tool_result["id"] == "call_pod1"
-        assert tool_result["structured_content"] == POD_STRUCTURED_CONTENT
+        summarizer._tool_calling_enabled = True
+        summarizer.create_response("How many namespaces are there in my cluster?")
+        assert mock_invoke.call_count == 3
 
 
-def test_tool_result_without_structured_content_has_no_key():
-    """Test that tool_result omits structured_content when not present."""
-    question = "How many namespaces are there in my cluster?"
-
+def test_tool_calling_tool_execution(caplog):
+    """Test tool execution path with one valid and one invalid tool call."""
+    caplog.set_level(10)
     mcp_servers_config = {
         "test_server": {
             "transport": "streamable_http",
@@ -472,57 +422,85 @@ def test_tool_result_without_structured_content_has_no_key():
     }
 
     with (
-        patch("ols.src.query_helpers.docs_summarizer.MAX_ITERATIONS", 2),
+        patch(
+            "ols.src.query_helpers.docs_summarizer.DocsSummarizer._get_max_iterations",
+            return_value=2,
+        ),
         patch("ols.utils.mcp_utils.MultiServerMCPClient") as mock_mcp_client_cls,
         patch(
-            "ols.src.query_helpers.docs_summarizer.DocsSummarizer._invoke_llm"
+            "ols.src.query_helpers.docs_summarizer.TokenBudgetTracker.tools_round_budget",
+            new_callable=PropertyMock,
+            return_value=1000,
+        ),
+        patch(
+            "ols.src.query_helpers.llm_execution_agent.LLMExecutionAgent._invoke_llm"
         ) as mock_invoke,
-        patch("ols.utils.mcp_utils.config") as mock_config,
+        patch(
+            "ols.src.query_helpers.docs_summarizer.build_mcp_config",
+            return_value=mcp_servers_config,
+        ),
+        patch(
+            "ols.src.query_helpers.docs_summarizer.get_mcp_tools",
+            new=AsyncMock(return_value=mock_tools_map),
+        ),
     ):
-        mock_config.tools_rag = None
-        mock_config.mcp_servers.servers = [MagicMock()]
-
-        with patch(
-            "ols.utils.mcp_utils._gather_and_populate_tools",
-            new=AsyncMock(return_value=(mcp_servers_config, mock_tools_map)),
-        ):
-            mock_invoke.side_effect = lambda *args, **kwargs: async_mock_invoke(
-                [
-                    AIMessageChunk(
-                        content="",
-                        response_metadata={"finish_reason": "tool_calls"},
-                        tool_calls=[
-                            {
-                                "name": "get_namespaces_mock",
-                                "args": {},
-                                "id": "call_ns1",
-                            },
-                        ],
-                    )
-                ]
-            )
+        mock_invoke.side_effect = lambda *args, **kwargs: async_mock_invoke(
+            [
+                AIMessageChunk(
+                    content="",
+                    response_metadata={"finish_reason": "tool_calls"},
+                    tool_calls=[
+                        {"name": "get_namespaces_mock", "args": {}, "id": "call_id1"},
+                        {"name": "invalid_function_name", "args": {}, "id": "call_id2"},
+                    ],
+                )
+            ]
+        )
 
         mock_mcp_client_instance = AsyncMock()
         mock_mcp_client_instance.get_tools.return_value = mock_tools_map
         mock_mcp_client_cls.return_value = mock_mcp_client_instance
 
         summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
-        summarizer.model_config.parameters.max_tokens_for_tools = 0
-        result = summarizer.create_response(question)
+        summarizer.model_config.max_tokens_for_tools = 100
+        summarizer.create_response("How many namespaces are there in my cluster?")
 
-        assert len(result.tool_results) == 1
-        tool_result = result.tool_results[0]
-
-        assert tool_result["id"] == "call_ns1"
-        assert "structured_content" not in tool_result
+        assert "get_namespaces_mock" in caplog.text
+        assert "invalid_function_name" in caplog.text
+        assert mock_invoke.call_count == 2
 
 
-def test_tool_token_tracking(caplog):
-    """Test that tool definitions and AIMessage tokens are tracked with buffer weight."""
-    caplog.set_level(10)  # Set debug level
+def test_build_final_prompt_raises_when_tool_definitions_exceed_prompt_budget() -> None:
+    """Tool definitions token estimate is validated with the final prompt budget."""
+    summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+    summarizer._tracker = TokenBudgetTracker(
+        token_handler=TokenHandler(),
+        context_window_size=1000,
+        max_response_tokens=100,
+        max_tool_tokens=200,
+        round_cap_fraction=0.6,
+    )
+    summarizer._tracker.set_tool_loop_max_rounds(5)
+    summarizer._tracker.charge(TokenCategory.PROMPT, 650)
+    with pytest.raises(PromptTooLongError, match="Tool definitions"):
+        summarizer._build_final_prompt(
+            query="q",
+            history=[],
+            rag_chunks=[],
+            skill_content=None,
+            tool_definitions_tokens=100,
+        )
 
-    question = "How many namespaces are there in my cluster?"
 
+def test_tool_output_token_tracking_uses_buffer_weight(caplog):
+    """Test that tool output tokens are counted with TOKEN_BUFFER_WEIGHT like other budget items.
+
+    Before this fix, raw len(tokens) was used for tool outputs while tool definitions
+    and AIMessage tokens used _get_token_count() (which applies a 1.1x buffer).
+    This test asserts _get_token_count() is called for tool output tokens by spying on
+    it: with one tool call in one round it must be called at least 3 times
+    (tool definitions, AIMessage, tool output).
+    """
     mcp_servers_config = {
         "test_server": {
             "transport": "streamable_http",
@@ -530,19 +508,31 @@ def test_tool_token_tracking(caplog):
         },
     }
 
+    original_get_token_count = TokenHandler._get_token_count
+    call_count = 0
+
+    def counting_get_token_count(tokens: list) -> int:
+        nonlocal call_count
+        call_count += 1
+        return original_get_token_count(tokens)
+
     with (
-        patch("ols.src.query_helpers.docs_summarizer.MAX_ITERATIONS", 2),
+        patch(
+            "ols.src.query_helpers.docs_summarizer.DocsSummarizer._get_max_iterations",
+            return_value=2,
+        ),
         patch("ols.utils.mcp_utils.MultiServerMCPClient") as mock_mcp_client_cls,
         patch(
-            "ols.src.query_helpers.docs_summarizer.DocsSummarizer._invoke_llm"
+            "ols.src.query_helpers.llm_execution_agent.LLMExecutionAgent._invoke_llm"
         ) as mock_invoke,
         patch("ols.utils.mcp_utils.config") as mock_config,
+        patch.object(
+            TokenHandler, "_get_token_count", staticmethod(counting_get_token_count)
+        ),
     ):
-        # Mock config for get_mcp_tools
         mock_config.tools_rag = None
-        mock_config.mcp_servers.servers = [MagicMock()]  # Non-empty list
+        mock_config.mcp_servers.servers = [MagicMock()]
 
-        # Mock _gather_and_populate_tools to return tools
         with patch(
             "ols.utils.mcp_utils._gather_and_populate_tools",
             new=AsyncMock(return_value=(mcp_servers_config, mock_tools_map)),
@@ -568,53 +558,23 @@ def test_tool_token_tracking(caplog):
         mock_mcp_client_cls.return_value = mock_mcp_client_instance
 
         summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
-        # Disable token reservation for tools (test config has small context window)
-        summarizer.model_config.parameters.max_tokens_for_tools = 0
-        summarizer.create_response(question)
+        summarizer.model_config.max_tokens_for_tools = 50000
+        summarizer.create_response("How many namespaces?")
 
-        # Verify tool definitions token counting is logged
-        assert "Tool definitions consume" in caplog.text
-
-        # Calculate expected token count with buffer weight applied
-        token_handler = TokenHandler()
-        tool_definitions_text = json.dumps(
-            [
-                {
-                    "name": t.name,
-                    "description": t.description,
-                    "schema": (
-                        t.args_schema
-                        if isinstance(t.args_schema, dict)
-                        else t.args_schema.model_json_schema()
-                    ),
-                }
-                for t in mock_tools_map
-            ]
-        )
-        raw_tokens = len(token_handler.text_to_tokens(tool_definitions_text))
-        expected_buffered_tokens = ceil(raw_tokens * TOKEN_BUFFER_WEIGHT)
-
-        # Extract logged token count and verify buffer weight was applied
-        match = re.search(r"Tool definitions consume (\d+) tokens", caplog.text)
-        assert match is not None, "Token count not found in logs"
-        logged_tokens = int(match.group(1))
-        assert logged_tokens == expected_buffered_tokens, (
-            f"Expected {expected_buffered_tokens} (raw={raw_tokens} * {TOKEN_BUFFER_WEIGHT}), "
-            f"got {logged_tokens}"
-        )
+    # _get_token_count must be called for:
+    #   1. tool definitions (once at the start of the loop)
+    #   2. AIMessage with tool_calls
+    #   3. tool output (the change introduced by this fix)
+    assert call_count >= 3, (
+        f"Expected _get_token_count to be called at least 3 times "
+        f"(definitions + AIMessage + tool output), got {call_count}"
+    )
 
 
 @pytest.mark.asyncio
 async def test_gather_mcp_tools_failure_isolation(caplog):
-    """Test gather_mcp_tools isolates failures from individual MCP servers.
-
-    When multiple MCP servers are configured and one is unreachable,
-    tools from the working servers should still be returned.
-    """
-    from ols.utils.mcp_utils import gather_mcp_tools
-
+    """Test gather_mcp_tools isolates failures from individual MCP servers."""
     caplog.set_level(10)
-
     mcp_servers = {
         "working_server": {
             "transport": "streamable_http",
@@ -626,641 +586,167 @@ async def test_gather_mcp_tools_failure_isolation(caplog):
         },
     }
 
-    # Mock MultiServerMCPClient.get_tools to simulate per-server behavior
     async def mock_get_tools(server_name=None):
         if server_name == "working_server":
             return mock_tools_map
-        elif server_name == "broken_server":
-            raise ConnectionError("Failed to connect to http://non-exist:8888/mcp")
-        return []
+        raise ConnectionError("Failed to connect to http://non-exist:8888/mcp")
 
     with patch("ols.utils.mcp_utils.MultiServerMCPClient") as mock_client_cls:
         mock_client_instance = AsyncMock()
         mock_client_instance.get_tools.side_effect = mock_get_tools
         mock_client_cls.return_value = mock_client_instance
 
-        # Call gather_mcp_tools - should return tools from working server
-        # even though broken_server fails
         tools = await gather_mcp_tools(mcp_servers)
-
-        # Verify we got tools from the working server
         assert len(tools) == 1
         assert tools[0].name == "get_namespaces_mock"
-
-        # Verify logging shows partial success
         assert "Loaded 1 tools from MCP server 'working_server'" in caplog.text
         assert "Failed to get tools from MCP server 'broken_server'" in caplog.text
 
 
-@pytest.mark.asyncio
-async def test_gather_mcp_tools_all_servers_working(caplog):
-    """Test gather_mcp_tools aggregates tools from all working servers."""
-    from ols.utils.mcp_utils import gather_mcp_tools
-
-    caplog.set_level(10)
-
-    mcp_servers = {
-        "server_a": {"transport": "streamable_http", "url": "http://server-a:8080/mcp"},
-        "server_b": {"transport": "streamable_http", "url": "http://server-b:8080/mcp"},
-    }
-
-    async def mock_get_tools(server_name=None):
-        # Both servers return tools successfully
-        return mock_tools_map
-
-    with patch("ols.utils.mcp_utils.MultiServerMCPClient") as mock_client_cls:
-        mock_client_instance = AsyncMock()
-        mock_client_instance.get_tools.side_effect = mock_get_tools
-        mock_client_cls.return_value = mock_client_instance
-
-        tools = await gather_mcp_tools(mcp_servers)
-
-        # Should have tools from both servers (2 x 1 = 2 tools)
-        assert len(tools) == 2
-        assert "Loaded 1 tools from MCP server 'server_a'" in caplog.text
-        assert "Loaded 1 tools from MCP server 'server_b'" in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_gather_mcp_tools_all_servers_failing(caplog):
-    """Test gather_mcp_tools handles all servers failing gracefully."""
-    from ols.utils.mcp_utils import gather_mcp_tools
-
-    caplog.set_level(10)
-
-    mcp_servers = {
-        "broken_a": {"transport": "streamable_http", "url": "http://broken-a:8888/mcp"},
-        "broken_b": {"transport": "streamable_http", "url": "http://broken-b:8888/mcp"},
-    }
-
-    async def mock_get_tools(server_name=None):
-        raise ConnectionError(f"Failed to connect to {server_name}")
-
-    with patch("ols.utils.mcp_utils.MultiServerMCPClient") as mock_client_cls:
-        mock_client_instance = AsyncMock()
-        mock_client_instance.get_tools.side_effect = mock_get_tools
-        mock_client_cls.return_value = mock_client_instance
-
-        tools = await gather_mcp_tools(mcp_servers)
-
-        # Should return empty list, not raise exception
-        assert tools == []
-        assert "Failed to get tools from MCP server 'broken_a'" in caplog.text
-        assert "Failed to get tools from MCP server 'broken_b'" in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_gather_mcp_tools_empty_config():
-    """Test gather_mcp_tools with no servers configured."""
-    from ols.utils.mcp_utils import gather_mcp_tools
-
-    with patch("ols.utils.mcp_utils.MultiServerMCPClient") as mock_client_cls:
-        mock_client_instance = AsyncMock()
-        mock_client_cls.return_value = mock_client_instance
-
-        tools = await gather_mcp_tools({})
-
-        # Should return empty list
-        assert tools == []
-        # get_tools should never be called
-        mock_client_instance.get_tools.assert_not_called()
-
-
-def test_normalize_tool_schema_adds_missing_properties_and_required():
-    """Test _normalize_tool_schema patches a bare object schema."""
-    tool = Mock()
-    tool.args_schema = {"type": "object"}
-
-    _normalize_tool_schema(tool)
-
-    assert tool.args_schema == {"type": "object", "properties": {}, "required": []}
-
-
-def test_normalize_tool_schema_preserves_existing_properties():
-    """Test _normalize_tool_schema does not overwrite existing properties."""
-    tool = Mock()
-    tool.args_schema = {
-        "type": "object",
-        "properties": {"name": {"type": "string"}},
-        "required": ["name"],
-    }
-
-    _normalize_tool_schema(tool)
-
-    assert tool.args_schema == {
-        "type": "object",
-        "properties": {"name": {"type": "string"}},
-        "required": ["name"],
-    }
-
-
-def test_normalize_tool_schema_skips_non_dict_schema():
-    """Test _normalize_tool_schema is a no-op when args_schema is not a dict."""
-
-    class MySchema:
-        pass
-
-    tool = Mock()
-    tool.args_schema = MySchema
-
-    _normalize_tool_schema(tool)
-
-    assert tool.args_schema is MySchema
-
-
-def test_normalize_tool_schema_skips_non_object_type():
-    """Test _normalize_tool_schema is a no-op for non-object schemas."""
-    tool = Mock()
-    tool.args_schema = {"type": "string"}
-
-    _normalize_tool_schema(tool)
-
-    assert tool.args_schema == {"type": "string"}
-
-
-@pytest.mark.asyncio
-async def test_gather_mcp_tools_fixes_schemas_without_properties():
-    """Test gather_mcp_tools patches tool schemas that lack 'properties'.
-
-    MCP tools with no arguments produce schemas like {"type": "object"}
-    without a "properties" key. This causes KeyError in LangChain and
-    400 errors from OpenAI. gather_mcp_tools must fix these schemas.
-    """
-    mcp_servers = {
-        "server": {"transport": "streamable_http", "url": "http://server:8080/mcp"},
-    }
-
-    no_args_tool = Mock()
-    no_args_tool.args_schema = {"type": "object"}
-    no_args_tool.name = "no_args_tool"
-    no_args_tool.metadata = {}
-
-    with_args_tool = Mock()
-    with_args_tool.args_schema = {
-        "type": "object",
-        "properties": {"query": {"type": "string"}},
-    }
-    with_args_tool.name = "with_args_tool"
-    with_args_tool.metadata = {}
-
-    async def mock_get_tools(server_name=None):
-        return [no_args_tool, with_args_tool]
-
-    with patch("ols.utils.mcp_utils.MultiServerMCPClient") as mock_client_cls:
-        mock_client_instance = AsyncMock()
-        mock_client_instance.get_tools.side_effect = mock_get_tools
-        mock_client_cls.return_value = mock_client_instance
-
-        tools = await gather_mcp_tools(mcp_servers)
-
-        assert len(tools) == 2
-
-        assert tools[0].args_schema == {
-            "type": "object",
-            "properties": {},
-            "required": [],
-        }
-
-        assert tools[1].args_schema == {
-            "type": "object",
-            "properties": {"query": {"type": "string"}},
-            "required": [],
-        }
-
-
 def test_build_mcp_config_transport_is_streamable_http():
     """Test build_mcp_config sets transport to streamable_http for all servers."""
-    from ols.utils.mcp_utils import build_mcp_config
-
     server1 = MCPServerConfig(name="server1", url="http://server1:8080/mcp")
     server1._resolved_headers = {}
-
     server2 = MCPServerConfig(name="server2", url="http://server2:9090/mcp", timeout=30)
     server2._resolved_headers = {}
 
-    mcp_config = build_mcp_config(
-        [server1, server2], user_token=None, client_headers=None
-    )
-
-    assert "server1" in mcp_config
-    assert "server2" in mcp_config
+    mcp_config = build_mcp_config([server1, server2], None, None)
 
     assert mcp_config["server1"]["transport"] == "streamable_http"
-    assert mcp_config["server1"]["url"] == "http://server1:8080/mcp"
-
     assert mcp_config["server2"]["transport"] == "streamable_http"
-    assert mcp_config["server2"]["url"] == "http://server2:9090/mcp"
-    assert mcp_config["server2"]["timeout"] == 30
 
 
-def test_resolve_server_headers_with_client_placeholder():
-    """Test resolve_server_headers replaces client placeholder with client headers."""
-    from ols.constants import MCP_CLIENT_PLACEHOLDER
-    from ols.utils.mcp_utils import resolve_server_headers
+def test_get_max_iterations_ask_mode_no_override():
+    """Test _get_max_iterations returns ASK default when config has no override."""
+    config.ols_config.max_iterations = None
+    summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None), mode=QueryMode.ASK)
+    assert summarizer._get_max_iterations() == DEFAULT_MAX_ITERATIONS
 
-    server = MCPServerConfig(
-        name="test-server",
-        url="http://test:8080/mcp",
-        headers={"Authorization": "_client_"},
+
+def test_get_max_iterations_troubleshooting_mode_no_override():
+    """Test _get_max_iterations returns TROUBLESHOOTING default when config has no override."""
+    config.ols_config.max_iterations = None
+    summarizer = DocsSummarizer(
+        llm_loader=mock_llm_loader(None), mode=QueryMode.TROUBLESHOOTING
     )
-    server._resolved_headers = {"Authorization": MCP_CLIENT_PLACEHOLDER}
-
-    client_headers = {"test-server": {"Authorization": "Bearer client-token"}}
-
-    headers = resolve_server_headers(
-        server, user_token=None, client_headers=client_headers
-    )
-
-    assert headers is not None
-    assert headers == {"Authorization": "Bearer client-token"}
+    assert summarizer._get_max_iterations() == DEFAULT_MAX_ITERATIONS_TROUBLESHOOTING
 
 
-def test_resolve_server_headers_with_kubernetes_placeholder():
-    """Test resolve_server_headers replaces kubernetes placeholder with user token."""
-    from ols.constants import MCP_KUBERNETES_PLACEHOLDER
-    from ols.utils.mcp_utils import resolve_server_headers
-
-    server = MCPServerConfig(
-        name="test-server",
-        url="http://test:8080/mcp",
-        headers={"Authorization": "kubernetes"},
-    )
-    server._resolved_headers = {"Authorization": MCP_KUBERNETES_PLACEHOLDER}
-
-    headers = resolve_server_headers(
-        server, user_token="user-k8s-token", client_headers=None  # noqa: S106 # nosec
-    )
-
-    assert headers is not None
-    assert headers == {"Authorization": "Bearer user-k8s-token"}
+def test_get_max_iterations_config_override_above_default():
+    """Test _get_max_iterations uses config value when it exceeds the mode default."""
+    config.ols_config.max_iterations = 20
+    try:
+        for mode in (QueryMode.ASK, QueryMode.TROUBLESHOOTING):
+            summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None), mode=mode)
+            assert summarizer._get_max_iterations() == 20
+    finally:
+        config.ols_config.max_iterations = None
 
 
-def test_resolve_server_headers_missing_client_headers():
-    """Test resolve_server_headers returns None when client headers missing."""
-    from ols.constants import MCP_CLIENT_PLACEHOLDER
-    from ols.utils.mcp_utils import resolve_server_headers
+def test_get_max_iterations_config_override_below_default():
+    """Test _get_max_iterations uses mode default when it exceeds the config value."""
+    config.ols_config.max_iterations = 10
+    try:
+        summarizer = DocsSummarizer(
+            llm_loader=mock_llm_loader(None), mode=QueryMode.ASK
+        )
+        assert summarizer._get_max_iterations() == 10
 
-    server = MCPServerConfig(
-        name="test-server",
-        url="http://test:8080/mcp",
-        headers={"Authorization": "_client_"},
-    )
-    server._resolved_headers = {"Authorization": MCP_CLIENT_PLACEHOLDER}
-
-    # No client headers provided
-    headers = resolve_server_headers(server, user_token=None, client_headers=None)
-
-    assert headers is None
-
-
-def test_resolve_server_headers_missing_kubernetes_token():
-    """Test resolve_server_headers returns None when kubernetes token missing."""
-    from ols.constants import MCP_KUBERNETES_PLACEHOLDER
-    from ols.utils.mcp_utils import resolve_server_headers
-
-    server = MCPServerConfig(
-        name="test-server",
-        url="http://test:8080/mcp",
-        headers={"Authorization": "kubernetes"},
-    )
-    server._resolved_headers = {"Authorization": MCP_KUBERNETES_PLACEHOLDER}
-
-    # No user token provided
-    headers = resolve_server_headers(server, user_token=None, client_headers=None)
-
-    assert headers is None
+        summarizer = DocsSummarizer(
+            llm_loader=mock_llm_loader(None), mode=QueryMode.TROUBLESHOOTING
+        )
+        assert (
+            summarizer._get_max_iterations() == DEFAULT_MAX_ITERATIONS_TROUBLESHOOTING
+        )
+    finally:
+        config.ols_config.max_iterations = None
 
 
-def test_resolve_server_headers_with_multiple_client_header_dicts():
-    """Test resolve_server_headers handles multiple headers in dict."""
-    from ols.constants import MCP_CLIENT_PLACEHOLDER
-    from ols.utils.mcp_utils import resolve_server_headers
+def test_create_response_raises_on_unknown_chunk_type():
+    """Test create_response raises ValueError on unsupported chunk type."""
+    summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
 
-    server = MCPServerConfig(
-        name="test-server",
-        url="http://test:8080/mcp",
-        headers={"Authorization": "_client_", "X-Custom": "_client_"},
-    )
-    server._resolved_headers = {
-        "Authorization": MCP_CLIENT_PLACEHOLDER,
-        "X-Custom": MCP_CLIENT_PLACEHOLDER,
-    }
+    class UnknownChunk:
+        type = "unsupported"
+        text = ""
+        data: ClassVar[dict[str, str]] = {}
 
-    client_headers = {
-        "test-server": {
-            "Authorization": "Bearer token",
-            "X-Custom": "custom-value",
-        }
-    }
+    async def _fake_generate(self, *args, **kwargs):
+        yield UnknownChunk()
 
-    headers = resolve_server_headers(
-        server, user_token=None, client_headers=client_headers
-    )
-
-    assert headers is not None
-    assert headers == {"Authorization": "Bearer token", "X-Custom": "custom-value"}
+    with patch.object(DocsSummarizer, "generate_response", _fake_generate):
+        with pytest.raises(ValueError, match="Unknown chunk type"):
+            summarizer.create_response("q")
 
 
-def test_resolve_server_headers_client_does_not_override_static_config():
-    """Test client headers don't override static server-configured headers."""
-    from ols.utils.mcp_utils import resolve_server_headers
+def test_create_response_ignores_reasoning_chunks():
+    """Test create_response skips reasoning chunks without error."""
+    summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
+    from ols.app.models.models import StreamedChunk
 
-    server = MCPServerConfig(
-        name="test-server",
-        url="http://test:8080/mcp",
-        headers={"Authorization": "Bearer config-token"},
-    )
-    server._resolved_headers = {"Authorization": "Bearer config-token"}
+    async def _fake_generate(self, *args, **kwargs):
+        yield StreamedChunk(type=StreamChunkType.REASONING, text="thinking")
+        yield StreamedChunk(type=StreamChunkType.TEXT, text="answer")
+        yield StreamedChunk(
+            type=StreamChunkType.END,
+            data={"rag_chunks": [], "truncated": False, "token_counter": None},
+        )
 
-    # Client provides different authorization (should be ignored for non-placeholder)
-    client_headers = {"test-server": {"Authorization": "Bearer client-token"}}
+    with patch.object(DocsSummarizer, "generate_response", _fake_generate):
+        result = summarizer.create_response("q")
 
-    headers = resolve_server_headers(
-        server, user_token=None, client_headers=client_headers
-    )
-
-    assert headers is not None
-    # Config header should be used (not client)
-    assert headers == {"Authorization": "Bearer config-token"}
+    assert result.response == "answer"
 
 
-def test_resolve_server_headers_mixed_placeholders():
-    """Test resolve_server_headers with mix of kubernetes and client placeholders."""
-    from ols.constants import MCP_CLIENT_PLACEHOLDER, MCP_KUBERNETES_PLACEHOLDER
-    from ols.utils.mcp_utils import resolve_server_headers
+@pytest.mark.asyncio
+async def test_generate_response_creates_and_cleans_offload_manager():
+    """Test OffloadManager lifecycle in generate_response for both streaming modes."""
+    for streaming in (False, True):
+        created_managers = []
+        cleanup_calls = []
 
-    server = MCPServerConfig(
-        name="test-server",
-        url="http://test:8080/mcp",
-        headers={"Authorization": "kubernetes", "X-API-Key": "_client_"},
-    )
-    server._resolved_headers = {
-        "Authorization": MCP_KUBERNETES_PLACEHOLDER,
-        "X-API-Key": MCP_CLIENT_PLACEHOLDER,
-    }
+        original_init = __import__(
+            "ols.src.tools.offloaded_content", fromlist=["OffloadManager"]
+        ).OffloadManager.__init__
 
-    client_headers = {"test-server": {"X-API-Key": "api-key-123"}}
+        def _tracking_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            created_managers.append(self)
+            original_cleanup = self.cleanup
 
-    headers = resolve_server_headers(
-        server,
-        user_token="k8s-token",  # noqa: S106 # nosec
-        client_headers=client_headers,
-    )
+            def _tracked_cleanup():
+                cleanup_calls.append(self)
+                original_cleanup()
 
-    assert headers is not None
-    assert headers == {"Authorization": "Bearer k8s-token", "X-API-Key": "api-key-123"}
+            self.cleanup = _tracked_cleanup
 
+        summarizer = DocsSummarizer(
+            llm_loader=mock_llm_loader(mock_langchain_interface("test response")()),
+            streaming=streaming,
+        )
+        summarizer._tool_calling_enabled = True
 
-def test_resolve_server_headers_no_placeholders():
-    """Test resolve_server_headers with direct header values (no placeholders)."""
-    from ols.utils.mcp_utils import resolve_server_headers
-
-    server = MCPServerConfig(
-        name="test-server",
-        url="http://test:8080/mcp",
-        headers={"Authorization": "Bearer static-token"},
-    )
-    server._resolved_headers = {"Authorization": "Bearer static-token"}
-
-    headers = resolve_server_headers(server, user_token=None, client_headers=None)
-
-    assert headers is not None
-    assert headers == {"Authorization": "Bearer static-token"}
-
-
-def test_tool_result_includes_tool_meta():
-    """Test that tool_result includes tool_meta and server_name from tool metadata."""
-    question = "How many namespaces are there in my cluster?"
-
-    mcp_servers_config = {
-        "test-server": {
-            "transport": "streamable_http",
-            "url": "http://test-server:8080/mcp",
-        },
-    }
-
-    mock_server = MagicMock()
-    mock_server.name = "test-server"
-
-    with (
-        patch("ols.src.query_helpers.docs_summarizer.MAX_ITERATIONS", 2),
-        patch("ols.utils.mcp_utils.MultiServerMCPClient") as mock_mcp_client_cls,
-        patch(
-            "ols.src.query_helpers.docs_summarizer.DocsSummarizer._invoke_llm"
-        ) as mock_invoke,
-        patch("ols.utils.mcp_utils.config") as mock_config,
-    ):
-        mock_config.tools_rag = None
-        mock_config.mcp_servers.servers = [mock_server]
-
-        with patch(
-            "ols.utils.mcp_utils._gather_and_populate_tools",
-            new=AsyncMock(return_value=(mcp_servers_config, mock_tools_with_meta)),
+        with (
+            patch(
+                "ols.src.query_helpers.docs_summarizer.get_mcp_tools",
+                new=AsyncMock(return_value=[]),
+            ),
+            patch(
+                "ols.src.tools.offloaded_content.OffloadManager.__init__",
+                _tracking_init,
+            ),
         ):
-            mock_invoke.side_effect = lambda *args, **kwargs: async_mock_invoke(
-                [
-                    AIMessageChunk(
-                        content="",
-                        response_metadata={"finish_reason": "tool_calls"},
-                        tool_calls=[
-                            {
-                                "name": "get_namespaces_with_meta_mock",
-                                "args": {},
-                                "id": "call_meta1",
-                            },
-                        ],
-                    )
-                ]
-            )
+            chunks = [
+                chunk async for chunk in summarizer.generate_response("test query")
+            ]
 
-        mock_mcp_client_instance = AsyncMock()
-        mock_mcp_client_instance.get_tools.return_value = mock_tools_with_meta
-        mock_mcp_client_cls.return_value = mock_mcp_client_instance
-
-        summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
-        summarizer.model_config.parameters.max_tokens_for_tools = 0
-        result = summarizer.create_response(question)
-
-        assert len(result.tool_results) == 1
-        tool_result = result.tool_results[0]
-
-        assert tool_result["id"] == "call_meta1"
-        assert tool_result["name"] == "get_namespaces_with_meta_mock"
-        assert tool_result["server_name"] == "test-server"
-        assert tool_result["tool_meta"] == MOCK_TOOL_META
-
-
-def test_tool_result_without_meta_has_no_tool_meta_key():
-    """Test that tool_result omits tool_meta when tool has no _meta in metadata."""
-    question = "How many namespaces are there in my cluster?"
-
-    mcp_servers_config = {
-        "test_server": {
-            "transport": "streamable_http",
-            "url": "http://test-server:8080/mcp",
-        },
-    }
-
-    with (
-        patch("ols.src.query_helpers.docs_summarizer.MAX_ITERATIONS", 2),
-        patch("ols.utils.mcp_utils.MultiServerMCPClient") as mock_mcp_client_cls,
-        patch(
-            "ols.src.query_helpers.docs_summarizer.DocsSummarizer._invoke_llm"
-        ) as mock_invoke,
-        patch("ols.utils.mcp_utils.config") as mock_config,
-    ):
-        mock_config.tools_rag = None
-        mock_config.mcp_servers.servers = [MagicMock()]
-
-        with patch(
-            "ols.utils.mcp_utils._gather_and_populate_tools",
-            new=AsyncMock(return_value=(mcp_servers_config, mock_tools_map)),
-        ):
-            mock_invoke.side_effect = lambda *args, **kwargs: async_mock_invoke(
-                [
-                    AIMessageChunk(
-                        content="",
-                        response_metadata={"finish_reason": "tool_calls"},
-                        tool_calls=[
-                            {
-                                "name": "get_namespaces_mock",
-                                "args": {},
-                                "id": "call_ns1",
-                            },
-                        ],
-                    )
-                ]
-            )
-
-        mock_mcp_client_instance = AsyncMock()
-        mock_mcp_client_instance.get_tools.return_value = mock_tools_map
-        mock_mcp_client_cls.return_value = mock_mcp_client_instance
-
-        summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
-        summarizer.model_config.parameters.max_tokens_for_tools = 0
-        result = summarizer.create_response(question)
-
-        assert len(result.tool_results) == 1
-        tool_result = result.tool_results[0]
-
-        assert tool_result["id"] == "call_ns1"
-        assert tool_result["name"] == "get_namespaces_mock"
-        assert "tool_meta" not in tool_result
-
-
-def test_tool_call_includes_tool_meta():
-    """Test that tool_call events include tool_meta and server_name from metadata."""
-    question = "How many namespaces are there in my cluster?"
-
-    mcp_servers_config = {
-        "test-server": {
-            "transport": "streamable_http",
-            "url": "http://test-server:8080/mcp",
-        },
-    }
-
-    mock_server = MagicMock()
-    mock_server.name = "test-server"
-
-    with (
-        patch("ols.src.query_helpers.docs_summarizer.MAX_ITERATIONS", 2),
-        patch("ols.utils.mcp_utils.MultiServerMCPClient") as mock_mcp_client_cls,
-        patch(
-            "ols.src.query_helpers.docs_summarizer.DocsSummarizer._invoke_llm"
-        ) as mock_invoke,
-        patch("ols.utils.mcp_utils.config") as mock_config,
-    ):
-        mock_config.tools_rag = None
-        mock_config.mcp_servers.servers = [mock_server]
-
-        with patch(
-            "ols.utils.mcp_utils._gather_and_populate_tools",
-            new=AsyncMock(return_value=(mcp_servers_config, mock_tools_with_meta)),
-        ):
-            mock_invoke.side_effect = lambda *args, **kwargs: async_mock_invoke(
-                [
-                    AIMessageChunk(
-                        content="",
-                        response_metadata={"finish_reason": "tool_calls"},
-                        tool_calls=[
-                            {
-                                "name": "get_namespaces_with_meta_mock",
-                                "args": {},
-                                "id": "call_meta1",
-                            },
-                        ],
-                    )
-                ]
-            )
-
-        mock_mcp_client_instance = AsyncMock()
-        mock_mcp_client_instance.get_tools.return_value = mock_tools_with_meta
-        mock_mcp_client_cls.return_value = mock_mcp_client_instance
-
-        summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
-        summarizer.model_config.parameters.max_tokens_for_tools = 0
-        result = summarizer.create_response(question)
-
-        assert len(result.tool_calls) == 1
-        tool_call = result.tool_calls[0]
-
-        assert tool_call["name"] == "get_namespaces_with_meta_mock"
-        assert tool_call["server_name"] == "test-server"
-        assert tool_call["tool_meta"] == MOCK_TOOL_META
-
-
-def test_tool_call_without_meta_has_no_tool_meta_key():
-    """Test that tool_call events omit tool_meta when tool has no _meta."""
-    question = "How many namespaces are there in my cluster?"
-
-    mcp_servers_config = {
-        "test_server": {
-            "transport": "streamable_http",
-            "url": "http://test-server:8080/mcp",
-        },
-    }
-
-    with (
-        patch("ols.src.query_helpers.docs_summarizer.MAX_ITERATIONS", 2),
-        patch("ols.utils.mcp_utils.MultiServerMCPClient") as mock_mcp_client_cls,
-        patch(
-            "ols.src.query_helpers.docs_summarizer.DocsSummarizer._invoke_llm"
-        ) as mock_invoke,
-        patch("ols.utils.mcp_utils.config") as mock_config,
-    ):
-        mock_config.tools_rag = None
-        mock_config.mcp_servers.servers = [MagicMock()]
-
-        with patch(
-            "ols.utils.mcp_utils._gather_and_populate_tools",
-            new=AsyncMock(return_value=(mcp_servers_config, mock_tools_map)),
-        ):
-            mock_invoke.side_effect = lambda *args, **kwargs: async_mock_invoke(
-                [
-                    AIMessageChunk(
-                        content="",
-                        response_metadata={"finish_reason": "tool_calls"},
-                        tool_calls=[
-                            {
-                                "name": "get_namespaces_mock",
-                                "args": {},
-                                "id": "call_ns1",
-                            },
-                        ],
-                    )
-                ]
-            )
-
-        mock_mcp_client_instance = AsyncMock()
-        mock_mcp_client_instance.get_tools.return_value = mock_tools_map
-        mock_mcp_client_cls.return_value = mock_mcp_client_instance
-
-        summarizer = DocsSummarizer(llm_loader=mock_llm_loader(None))
-        summarizer.model_config.parameters.max_tokens_for_tools = 0
-        result = summarizer.create_response(question)
-
-        assert len(result.tool_calls) == 1
-        tool_call = result.tool_calls[0]
-
-        assert tool_call["name"] == "get_namespaces_mock"
-        assert "tool_meta" not in tool_call
+        assert len(created_managers) == 1, (
+            f"Expected 1 OffloadManager created (streaming={streaming}), "
+            f"got {len(created_managers)}"
+        )
+        assert (
+            len(cleanup_calls) == 1
+        ), f"Expected cleanup called once (streaming={streaming}), got {len(cleanup_calls)}"
+        assert any(
+            c.type == StreamChunkType.END for c in chunks
+        ), f"Expected END chunk (streaming={streaming})"

@@ -38,7 +38,8 @@ def test_pyroscope_server_reachable(mock_config, mock_logger):
     """Test that Pyroscope starts when the server is reachable."""
     with (
         patch("ols.utils.pyroscope.requests.get") as mock_get,
-        patch("ols.runners.uvicorn.uvicorn.run") as mock_run,
+        patch("ols.runners.uvicorn.uvicorn.Config") as mock_uvicorn_config_cls,
+        patch("ols.runners.uvicorn.uvicorn.Server") as mock_uvicorn_server_cls,
         patch("ols.utils.pyroscope.threading.Thread") as mock_thread,
         patch.dict("sys.modules", {"pyroscope": MagicMock()}) as mock_pyroscope_module,
     ):
@@ -53,7 +54,8 @@ def test_pyroscope_server_reachable(mock_config, mock_logger):
             "Pyroscope server is reachable at %s", mock_config.dev_config.pyroscope_url
         )
         mock_pyroscope.configure.assert_called_once()
-        mock_run.assert_called_once()
+        mock_uvicorn_config_cls.assert_called_once()
+        mock_uvicorn_server_cls.return_value.run.assert_called_once_with()
         mock_thread.assert_called_once_with(target=mock_config.rag_index)
 
 

@@ -6,16 +6,17 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from fastapi import FastAPI, Request, Response
 from starlette.datastructures import Headers
 from starlette.responses import StreamingResponse
-from starlette.routing import Mount, Route, WebSocketRoute
+from starlette.routing import BaseRoute, Mount, Route, WebSocketRoute
 
 from ols import config, constants, version
 from ols.app import metrics, routers
-from ols.customize import metadata
+from ols.constants import SERVICE_NAME
 from ols.src.config_status import extract_config_status, store_config_status
+from ols.src.tools.offloaded_content import cleanup_offload_storage
 
 app = FastAPI(
-    title=f"Swagger {metadata.SERVICE_NAME} service - OpenAPI",
-    description=f"{metadata.SERVICE_NAME} service API specification.",
+    title=f"Swagger {SERVICE_NAME} service - OpenAPI",
+    description=f"{SERVICE_NAME} service API specification.",
     version=version.__version__,
     license_info={
         "name": "Apache 2.0",
@@ -190,11 +191,26 @@ async def log_requests_responses(
 
 routers.include_routers(app)
 
-app_routes_paths = [
-    route.path
-    for route in app.routes
-    if isinstance(route, (Mount, Route, WebSocketRoute))
-]
+
+def _collect_app_route_paths(routes: list[BaseRoute]) -> list[str]:
+    """Collect route paths for metrics middleware, including included routers."""
+    paths: list[str] = []
+    for route in routes:
+        if hasattr(route, "effective_candidates"):
+            for candidate in route.effective_candidates():
+                if hasattr(candidate, "effective_candidates"):
+                    paths.extend(_collect_app_route_paths([candidate]))
+                elif path := getattr(candidate, "path", None):
+                    paths.append(path)
+            continue
+        if isinstance(route, (Mount, Route, WebSocketRoute)) and route.path is not None:
+            paths.append(route.path)
+    return paths
+
+
+app_routes_paths = _collect_app_route_paths(app.routes)
+
+cleanup_offload_storage(config.ols_config.offload_storage_path)
 
 if config.ols_config.user_data_collection.config_status_enabled:
     try:

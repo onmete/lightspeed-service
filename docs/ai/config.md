@@ -103,6 +103,83 @@ Config classes have two validation phases:
 
 If you add a new config class that needs file existence checks or cross-section validation, add a `validate_yaml()` method and call it from the appropriate parent config's `validate_yaml()`.
 
+### Optional Solr hybrid RAG (`ols_config.solr_hybrid`)
+
+Omit the key to leave Solr hybrid RAG off (no client, no tool). When present, values map to `SolrHybridSettings` and the feature is active. `solr_http_base` must be a valid `http` or `https` URL with a host (checked in `validate_yaml()`).
+
+```yaml
+ols_config:
+  solr_hybrid:
+    solr_http_base: "https://solr.example.com:8983"
+    # max_results, hybrid_*, max_expansion_neighbors: optional overrides
+```
+
+Product documentation is served exclusively via Solr (OKP). Local FAISS indexes
+under ``reference_content`` are for BYOK (user-supplied) content only.
+
+### Hybrid search and chunk expansion
+
+OLS sends a hybrid query to OKP Solr's ``/hybrid-search`` endpoint. The query
+performs keyword retrieval first, then reranks candidates by KNN vector
+similarity. See the
+[OKP RAG Chunk Retrieval Strategy](https://docs.google.com/document/d/1W7G3Tbz5peMAh8cnGcpKvayQAciAyDXzXY_5KXdkY_0/edit?tab=t.0)
+for the full specification.
+
+Solr returns raw matched chunks. OLS implements chunk expansion client-side
+(all logic in ``SolrHybridSearch`` in ``ols/src/rag_index/solr_support.py``):
+
+1. **Deduplicate by parent** — keep only the first (highest-scored) chunk per
+   ``parent_id``. Chunks without a ``parent_id`` are kept as-is.
+2. **Cap results** — slice the deduped list to ``max_results``.
+3. **Compute per-chunk budget** — divide the tool's ``tools_token_budget``
+   (set by the execution framework via ``tool.metadata``) equally across the
+   deduped chunks. When the budget is 0, skip expansion entirely and return
+   the matched chunk as-is.
+4. **Fetch family** — for each matched chunk, query Solr ``/select`` for all
+   chunks sharing the same ``parent_id`` AND ``heading_id`` (ordered by
+   ``chunk_index``). Orphan chunks (missing ``heading_id``) skip this step.
+5. **Expand around match** — starting from the matched chunk, alternate
+   between previous and next siblings until one of these limits is hit:
+   - per-chunk token budget exhausted (tracked via ``num_tokens``)
+   - ``max_expansion_neighbors`` reached on each side (default 2, configurable
+     0–10 in ``SolrHybridSettings``; 0 disables expansion)
+6. **Concatenate** — assemble the expanded chunks in ``chunk_index`` order,
+   strip HTML, and return as the tool result (one content block per deduped
+   match).
+
+Relevant Solr fields for expansion:
+
+| Field | Purpose |
+|---|---|
+| ``parent_id`` | Groups chunks by source document |
+| ``chunk_index`` | Sequential ordering for neighbor expansion |
+| ``heading_id`` | Family grouping (chunks under the same heading) |
+| ``num_tokens`` | Token count per chunk for budget tracking |
+
+Relevant config fields on ``SolrHybridSettings``:
+
+| Field | Default | Purpose |
+|---|---|---|
+| ``max_results`` | 5 | Max deduped chunks returned |
+| ``max_expansion_neighbors`` | 2 | Max siblings per side during expansion (0 disables) |
+
+### OCP version resolution at startup
+
+When ``solr_hybrid`` is configured, ``SolrHybridSearch.__init__`` resolves the
+OCP product version for ``chunk_filter_query``:
+
+1. Read the ``OCP_CLUSTER_VERSION`` environment variable (set by the operator).
+   If not set, raise ``InvalidConfigurationError`` and stop.
+2. Query Solr for available versions of ``openshift_container_platform``
+   (facet on ``product_version`` with ``fq=product:openshift_container_platform``).
+3. Clamp the requested version to the nearest available:
+   - env version < lowest available → use lowest available
+   - env version > highest available → use highest available
+   - otherwise → use the closest available version ≤ requested
+4. Build ``chunk_filter_query``:
+   ``is_chunk:true AND product:openshift_container_platform AND product_version:<resolved>``
+
+
 ## Important Constants
 
 Config-related constants live in `ols/constants.py`:
@@ -115,3 +192,4 @@ Config-related constants live in `ols/constants.py`:
 | `DEFAULT_MAX_TOKENS_FOR_RESPONSE` | (int) | Default token limit |
 | `SUPPORTED_PROVIDER_TYPES` | frozenset | Validated against in `ProviderConfig.set_provider_type()` |
 | `SUPPORTED_AUTHENTICATION_MODULES` | frozenset | Validated in `AuthenticationConfig` |
+| `tool_round_cap_fraction` | (YAML: `ols_config.tool_round_cap_fraction`) | Global per-round MCP tool budget cap; bounds `TOOL_ROUND_CAP_FRACTION_MIN` / `MAX` in `ols/constants.py` |

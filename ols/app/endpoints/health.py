@@ -49,7 +49,7 @@ def llm_is_ready() -> bool:
             config.ols_config.default_model,
         )
         response = bare_llm.invoke(input="Hello there!")
-        # BAM and Watsonx replies as str and not as `AIMessage`
+        # Watsonx replies as str and not as `AIMessage`
         if isinstance(response, (str, AIMessage)):
             logger.info("LLM connection checked - LLM is ready")
             llm_is_ready_persistent_state = True
@@ -62,9 +62,10 @@ def llm_is_ready() -> bool:
 
 def index_is_ready() -> bool:
     """Check if the index is loaded."""
-    if config.rag_index is None and config.ols_config.reference_content is not None:
-        return False
-    return True
+    ref = config.ols_config.reference_content
+    if ref is None or not ref.indexes:
+        return True
+    return config.rag_index is not None
 
 
 def cache_is_ready() -> bool:

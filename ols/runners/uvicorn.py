@@ -4,7 +4,7 @@ import logging
 
 import uvicorn
 
-from ols.utils import ssl
+from ols.utils import ssl as ssl_utils
 from ols.utils.config import AppConfig
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -25,7 +25,7 @@ def start_uvicorn(config: AppConfig) -> None:
     )
     log_level = config.ols_config.logging_config.uvicorn_log_level
 
-    # The tls fields can be None, which means we will pass those values as None to uvicorn.run
+    # The tls fields can be None, which means we will pass those values through to Uvicorn.
     ssl_keyfile = config.ols_config.tls_config.tls_key_path
     ssl_certfile = config.ols_config.tls_config.tls_certificate_path
     ssl_keyfile_password = config.ols_config.tls_config.tls_key_password
@@ -34,10 +34,11 @@ def start_uvicorn(config: AppConfig) -> None:
     # when TLS security profile is not specified, default values will be used
     # that default values are based on default SSL package settings
     sec_profile = config.ols_config.tls_security_profile
-    ssl_version = ssl.get_ssl_version(sec_profile)
-    ssl_ciphers = ssl.get_ciphers(sec_profile)
+    ssl_version = ssl_utils.get_ssl_version(sec_profile)
+    min_tls_version = ssl_utils.get_min_tls_version(sec_profile)
+    ssl_ciphers = ssl_utils.get_ciphers(sec_profile)
 
-    uvicorn.run(
+    uvicorn_config = uvicorn.Config(
         "ols.app.main:app",
         host=host,
         port=port,
@@ -50,3 +51,9 @@ def start_uvicorn(config: AppConfig) -> None:
         ssl_ciphers=ssl_ciphers,
         access_log=log_level < logging.INFO,
     )
+    uvicorn_config.load()
+    if uvicorn_config.ssl is not None and min_tls_version is not None:
+        uvicorn_config.ssl.minimum_version = min_tls_version
+
+    server = uvicorn.Server(uvicorn_config)
+    server.run()
